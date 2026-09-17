@@ -68,6 +68,9 @@ label.break-continue-not-found	emit_break	named break or continue must resolve a
 lexical-binding.duplicate-declaration	define_var	lexical declarations cannot duplicate an existing lexical binding in the same scope
 lexical-binding.let-identifier	js_parse_var	let cannot be used as a lexical binding name followed by let or const
 logical-assignment.non-simple-target	get_lvalue	logical assignment requires a simple assignment target
+module.circular-export	js_resolve_export_throw_error	module resolution reports a cycle while looking up an indirectly exported binding
+module.dependency-parse-break	emit_break	module resolution surfaces a dependency parse error for a break outside a loop or switch
+module.dependency-parse-lvalue	get_lvalue	module resolution surfaces a dependency parse error for an invalid assignment target
 module.import-attributes.duplicate-key	js_parse_with_clause	static import attributes reject decoded duplicate keys
 module.invalid-import-binding	js_parse_import	import bindings cannot use restricted identifiers
 module.json-parse	json_parse_value	JSON module resolution reports strict JSON grammar errors from the authenticated fixture
