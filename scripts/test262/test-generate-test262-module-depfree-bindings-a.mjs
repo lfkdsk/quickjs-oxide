@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -30,7 +30,20 @@ const before = new Map(protectedFiles.map((path) => [path, readFileSync(path)]))
 const output = mkdtempSync(join(tmpdir(), "quickjs-oxide-depfree-bindings-a-"));
 try {
   const generated = run(["--output", output]);
-  assert.match(generated.stdout, /generated 11 authenticated evidence files/u);
+  assert.match(generated.stdout, /generated 11 transient audit files/u);
+  assert.deepEqual(readdirSync(output).sort(), [
+    "test262-module-depfree-bindings-a-admission-rows.tsv",
+    "test262-module-depfree-bindings-a-closures.tsv",
+    "test262-module-depfree-bindings-a-edges.tsv",
+    "test262-module-depfree-bindings-a-exclusions.tsv",
+    "test262-module-depfree-bindings-a-ledger.tsv",
+    "test262-module-depfree-bindings-a-negative-diagnostic-candidates.tsv",
+    "test262-module-depfree-bindings-a-negative-diagnostic-rules.tsv",
+    "test262-module-depfree-bindings-a-negative-diagnostics.tsv",
+    "test262-module-depfree-bindings-a-negatives.txt",
+    "test262-module-depfree-bindings-a-sources.txt",
+    "test262-module-depfree-bindings-a.txt",
+  ]);
 
   const manifest = readFileSync(
     join(output, "test262-module-depfree-bindings-a.txt"),

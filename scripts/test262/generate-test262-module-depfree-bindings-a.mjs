@@ -570,7 +570,11 @@ const negativeDiagnostics = lines(
   ...negativeDiagnosticRecords,
 );
 
-const evidence = new Map([
+// These views are useful when reviewing a cohort, but they duplicate the
+// promoted profile, admission catalog, and diagnostic ledgers. Keep them
+// available through --output for local/CI auditing without checking copies
+// into dev-support/test262/generated/.
+const generatedViews = new Map([
   ["dev-support/test262/generated/test262-module-depfree-bindings-a.txt", manifest],
   ["dev-support/test262/generated/test262-module-depfree-bindings-a-sources.txt", sourceManifest],
   ["dev-support/test262/generated/test262-module-depfree-bindings-a-edges.tsv", rootedEdges],
@@ -597,19 +601,12 @@ if (mode === "--admissions") {
   process.stdout.write(diagnosticRulesText);
 } else if (mode === "output") {
   assert(output, "--output requires a directory");
-  for (const [relativePath, contents] of evidence) {
+  for (const [relativePath, contents] of generatedViews) {
     writeFileSync(join(output, basename(relativePath)), contents);
   }
-  console.log(`generated ${evidence.size} authenticated evidence files in ${output}`);
+  console.log(`generated ${generatedViews.size} transient audit files in ${output}`);
 } else {
   assertAdmissionGroup(checkedAdmissions, admissionGroup, admissionRecords);
-  for (const [relativePath, contents] of evidence) {
-    assert.equal(
-      readFileSync(join(root, relativePath), "utf8"),
-      contents,
-      `${relativePath} drifted`,
-    );
-  }
   const checkedDiagnosticText = readFileSync(checkedDiagnostics, "utf8");
   for (const record of negativeDiagnosticRecords) {
     assert(
