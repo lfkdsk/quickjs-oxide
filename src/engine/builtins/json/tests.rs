@@ -367,8 +367,8 @@ fn json_parse_nesting_cutoff_matches_the_pinned_stack_budget() {
     // stack: a clean top-level call accepts 10,893 nested containers around a
     // leaf and rejects the next value with a catchable SyntaxError. Empty
     // containers reach one less value-entry depth, so they survive one level
-    // further. These exact clean-top-level counts are pinned here; see
-    // findings/verify-B10-json-depth.md for the call-depth jitter ledger.
+    // further. These exact clean-top-level counts are pinned here; the
+    // remaining call-depth difference is recorded in docs/deviations.md.
     let runtime = Runtime::new();
     let mut context = runtime.new_context();
 

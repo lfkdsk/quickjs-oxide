@@ -145,9 +145,9 @@ initial snapshot. Both paths are pinned in
 
 - Status: open implementation frontier; no target deviation is approved.
 - Surface: deeply nested `JSON.parse` values and work performed by a reviver
-  while its post-order walk is deeply nested. JSON modules are not part of
-  this open difference: their distinct clean-entry cutoff is calibrated
-  separately at 10,911 accepted containers and 10,912 rejected containers.
+  while its post-order walk is deeply nested. The previously observed
+  clean-entry JSON-module mismatch is resolved: modules have a distinct budget
+  calibrated at 10,911 accepted containers and 10,912 rejected containers.
 - Upstream anchors: pinned `quickjs.c` checks `js_check_stack_overflow` from
   `json_next_token` and `internalize_json_property`; `quickjs.h` defines the
   shared `JS_DEFAULT_STACK_SIZE` as one MiB. Parsing, the reviver walk, active
@@ -155,9 +155,9 @@ initial snapshot. Both paths are pinned in
   stack budget.
 - Rust behavior: JSON parsing and reviver traversal keep container/node state
   on heap vectors. Fixed logical budgets reproduce pinned QuickJS's clean-call
-  cutoffs (10,893 for `JSON.parse`, 4,085 for a reviver) without risking a Rust
-  host-stack abort, but they do not shrink as unrelated JavaScript or reviver
-  work consumes stack.
+  cutoffs (10,893 for `JSON.parse`, 10,911 for JSON modules, and 4,085 for a
+  reviver) without risking a Rust host-stack abort, but they do not shrink as
+  unrelated JavaScript or reviver work consumes stack.
 - Rationale: raising the former recursive Rust limits to the pinned clean-call
   values caused a process-aborting native stack overflow. The iterative
   representation is required by the robustness gate; dynamically emulating
@@ -185,22 +185,27 @@ Pinned QuickJS prints `SyntaxError:stack overflow`; Rust prints `OK`.
 
 Minimal nested-reviver probes use a 4,000-deep outer array. In the first
 (deepest) callback, parsing a separate 5,000-deep array produces
-`SyntaxError:stack overflow` in pinned QuickJS and `OK` in Rust. Recursing 200
-ordinary JavaScript calls from that callback produces
+`SyntaxError:stack overflow` in pinned QuickJS and `OK` in Rust. In a separate
+run, recursing 200 ordinary JavaScript calls from that callback produces
 `InternalError:stack overflow` in pinned QuickJS and `OK` in Rust:
 
 ```js
-var outer = "[".repeat(4000) + "0" + "]".repeat(4000);
-var inner = "[".repeat(5000) + "0" + "]".repeat(5000);
-var first = true;
-JSON.parse(outer, function (key, value) {
-  if (first) {
-    first = false;
-    try { JSON.parse(inner); print("OK"); }
-    catch (error) { print(error.name + ":" + error.message); }
-  }
-  return value;
-});
+function recurse(depth) { return depth ? recurse(depth - 1) : 0; }
+function probe(kind) {
+  var outer = "[".repeat(4000) + "0" + "]".repeat(4000);
+  var inner = "[".repeat(5000) + "0" + "]".repeat(5000);
+  var first = true;
+  JSON.parse(outer, function (key, value) {
+    if (first) {
+      first = false;
+      try { kind === "parse" ? JSON.parse(inner) : recurse(200); print("OK"); }
+      catch (error) { print(error.name + ":" + error.message); }
+    }
+    return value;
+  });
+}
+probe("parse");
+probe("recurse");
 ```
 
 - Dynamic import retries failed acyclic source graphs as pinned QuickJS does.
