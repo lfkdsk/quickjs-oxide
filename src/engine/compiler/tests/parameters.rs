@@ -506,6 +506,9 @@ fn parameter_assignment_prescan_retains_quickjs_bits_at_the_depth_bound() {
         module_declaration_export_target: None,
         anonymous_function_definition: None,
         pending_unsupported: None,
+        stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(
+            crate::engine::compiler::stack_guard::ParserStackContext::Direct,
+        ),
     };
 
     assert_eq!(parser.parenthesized_parameter_has_assignment(), Some(true));

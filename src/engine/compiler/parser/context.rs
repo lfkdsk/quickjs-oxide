@@ -275,6 +275,9 @@ pub(in crate::engine::compiler) struct Parser<'source> {
     /// engine frontier. The parser keeps going so later grammar and early
     /// errors retain QuickJS priority over the implementation diagnostic.
     pub(in crate::engine::compiler) pending_unsupported: Option<Error>,
+    /// Shared logical and physical recursion guard for this parse.
+    pub(in crate::engine::compiler) stack_guard:
+        crate::engine::compiler::stack_guard::ParserStackGuard,
 }
 
 pub(in crate::engine::compiler) enum RootCompileContext {

@@ -106,14 +106,23 @@ impl<'source> Parser<'source> {
             }
             TokenKind::Punctuator(Punctuator::LeftParen) => {
                 self.advance()?;
-                self.parse_expression()?;
+                self.parse_recursion(
+                    crate::engine::compiler::stack_guard::ParserStackFrame::Parenthesized,
+                    Self::parse_expression,
+                )?;
                 self.expect_punctuator(Punctuator::RightParen)?;
             }
             TokenKind::Punctuator(Punctuator::LeftBrace) => {
-                self.parse_object_literal()?;
+                self.parse_recursion(
+                    crate::engine::compiler::stack_guard::ParserStackFrame::ObjectLiteral,
+                    Self::parse_object_literal,
+                )?;
             }
             TokenKind::Punctuator(Punctuator::LeftBracket) => {
-                self.parse_array_literal()?;
+                self.parse_recursion(
+                    crate::engine::compiler::stack_guard::ParserStackFrame::ArrayLiteral,
+                    Self::parse_array_literal,
+                )?;
             }
             TokenKind::Template(_) => {
                 self.parse_template_literal()?;
@@ -145,7 +154,10 @@ impl<'source> Parser<'source> {
                 self.parse_class_expression()?;
             }
             TokenKind::Keyword(Keyword::New) => {
-                self.parse_new_expression()?;
+                self.parse_recursion(
+                    crate::engine::compiler::stack_guard::ParserStackFrame::NewWithoutArguments,
+                    Self::parse_new_expression,
+                )?;
             }
             TokenKind::Keyword(Keyword::Super) => {
                 self.parse_super_property(token.span)?;
@@ -163,7 +175,10 @@ impl<'source> Parser<'source> {
                 )));
             }
             TokenKind::Keyword(Keyword::Import) => {
-                self.parse_import_expression(token.span, import_call_allowed)?;
+                self.parse_recursion(
+                    crate::engine::compiler::stack_guard::ParserStackFrame::DynamicImport,
+                    |parser| parser.parse_import_expression(token.span, import_call_allowed),
+                )?;
             }
             TokenKind::Keyword(Keyword::Yield)
                 if matches!(

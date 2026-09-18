@@ -1,127 +1,117 @@
-//! Deterministic parser recursion budgeting.
+//! Deterministic parser recursion budgeting with a physical stack backstop.
 //!
-//! Pinned QuickJS bounds every recursive grammar production in `next_token()`
-//! (`quickjs.c:22719`) with one physical byte budget: when the C stack pointer
-//! crosses `rt->stack_top - JS_DEFAULT_STACK_SIZE` (1 MiB,
-//! `quickjs.h:327`), the parser returns `js_parse_error(s, "stack overflow")`,
-//! a catchable `SyntaxError`. Different productions therefore fail at
-//! different nesting depths purely because their C frames differ in size.
-//!
-//! Rust recursive-descent frames are materially larger than the C frames and
-//! vary in debug/release, so a single byte budget measured from the Rust
-//! stack pointer cannot reproduce those depths. This module mirrors the
-//! hybrid the VM already uses in `runtime/native_stack.rs`:
-//!
-//! 1. A weighted logical budget. Each recursive production contributes a
-//!    weight proportional to the pinned C frame size, calibrated so that an
-//!    `eval`-wrapped nesting fails at the pinned depth on an 8 MiB thread.
-//!    Mixed nesting composes by summing weights, exactly like the single C
-//!    byte budget it models.
-//! 2. A physical host-stack backstop. The weighted budget only classifies
-//!    enumerated productions; the backstop guarantees a catchable error
-//!    before a Rust stack overflow for any other recursion (or a small host
-//!    thread).
-//!
-//! Both limits surface the same `SyntaxError: stack overflow` the pinned
-//! engine throws; the process never aborts.
+//! Pinned QuickJS checks its C stack in next_token() (quickjs.c:22719). The
+//! Rust parser keeps that structural invariant: every committed token advance
+//! samples the native stack, including productions which have no logical
+//! weight of their own. A separate weighted budget reproduces the pinned
+//! nesting boundaries despite different Rust and C frame sizes.
 
-/// Total logical recursion budget, in [`WEIGHT_SCALE`] units. It models the
-/// pinned 1 MiB `JS_DEFAULT_STACK_SIZE`: weights are `SCALE / pinned_depth`,
-/// so an all-one-production nesting reaches this total at the pinned
-/// first-throw depth measured on an 8 MiB host thread.
-const PARSER_STACK_BUDGET: u64 = WEIGHT_SCALE;
+#[cfg(target_os = "linux")]
+use std::cell::Cell;
 
-/// Weight units per budget byte. `2^32` is larger than the square of every
-/// observed pinned depth (max ~9330), so integer-division weights reproduce
-/// every first-throw depth exactly: `floor(SCALE/depth)` first rejects at
-/// `depth + 1`.
-const WEIGHT_SCALE: u64 = 1 << 32;
+/// Logical budget used for an eval-created parser. The weights below are
+/// calibrated against QuickJS 2026-06-04's default one-MiB stack budget.
+const PARSER_STACK_BUDGET: u64 = 1 << 32;
 
-/// Stack kept between the physical backstop trigger and the host guard page.
-/// It only has to cover the immediate frame and one shallow error return;
-/// unwinding frames drop locals without re-entering the parser. Debug frames
-/// are larger, so keep a calibrated debug allowance as the VM guard does.
-/// Headroom kept between the deepest stack check and the host guard page.
-///
-/// The check runs in a parent frame *before* the next production descends, so
-/// this margin only has to cover the largest single parser frame built before
-/// the following check, plus constructing and unwinding the catchable error.
-/// Measured abort boundary on a 256–1024 KiB thread: release is abort-free at
-/// 8 KiB and aborts at 4 KiB; debug frames are larger and need 64 KiB. Keep a
-/// safety factor above those floors (16 KiB release, 96 KiB debug) as the VM
-/// guard does for its calibrated debug allowance.
+/// Main Script/Module roots start closer to QuickJS's runtime stack top than
+/// an eval compiler does. Separate weights below reproduce that observable
+/// direct-source boundary; the budget itself remains shared and composable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ParserStackContext {
+    Direct,
+    Eval,
+}
+
+/// Maximum native-stack reserve after the deepest token-edge check.
+/// Normal-sized stacks retain the allowance calibrated by task B8. A parser
+/// which itself starts near the bottom of a deliberately constrained stack
+/// uses the adaptive fraction below so shallow source remains usable.
 const PARSER_STACK_RESERVE: usize = if cfg!(debug_assertions) {
     96 * 1024
 } else {
     16 * 1024
 };
 
-/// On non-Linux hosts (where the stack region cannot be read from
-/// `/proc/self/maps`) the backstop allows this much Rust-stack growth from
-/// the parse entry point before throwing. Conservative by design: a
-/// catchable early error is preferred over an unwind across the guard page.
-#[cfg(not(target_os = "linux"))]
+/// Never descend without enough room to construct and unwind the syntax
+/// error. Token-edge sampling is frequent enough for this lower allowance on
+/// small stacks; the regression test exercises a 2 MiB thread.
+const PARSER_STACK_MIN_RESERVE: usize = if cfg!(debug_assertions) {
+    24 * 1024
+} else {
+    8 * 1024
+};
+
+/// A parse may consume at most this much native stack from its entry point
+/// when the OS stack extent is unknown. This is deliberately below the 8 MiB
+/// main-thread and CLI worker stacks, and it also handles Linux's
+/// RLIMIT_STACK=unlimited case without treating the current growable VMA as
+/// the real stack floor.
 const PARSER_FALLBACK_GROWTH: usize = if cfg!(debug_assertions) {
     1024 * 1024
 } else {
-    5 * 1024 * 1024
+    6 * 1024 * 1024
 };
 
-/// Marginal weight of one recursive grammar edge, in [`WEIGHT_SCALE`] units.
-///
-/// Weights are charged at the exact parser edge that executes once per
-/// nesting level (a container's *entry*, never once per flat sibling), so
-/// sequential non-nested constructs return the budget to its baseline while
-/// genuinely nested productions accumulate. Compositions (e.g.
-/// `if(1){` = statement head + block) therefore sum like the single C byte
-/// budget they model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+struct StackRegion {
+    low: usize,
+    high: usize,
+    growable_main: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+struct LinuxStackMetadata {
+    region: Option<StackRegion>,
+    rlimit_soft: Option<usize>,
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// /proc describes the current thread's stack mapping. Read it once per
+    /// thread, not once per Parser (eval, Function, and module compilation can
+    /// construct thousands of parsers on the same thread).
+    static LINUX_STACK_METADATA: Cell<Option<LinuxStackMetadata>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static LINUX_STACK_METADATA_LOADS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Marginal logical cost of one recursive grammar edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ParserStackFrame {
-    /// `( Expression )` primary — pinned first throw at depth 718.
     Parenthesized,
-    /// `[ Element ]` array literal entry — pinned 743.
     ArrayLiteral,
-    /// `{ Property }` object literal entry. The `({a: … })` stress form
-    /// crosses one parenthesis plus one of these per level and fails at 355;
-    /// bare nested objects fail at 701.
     ObjectLiteral,
-    /// A call/construct argument list entry (`f(` / `new F(`) — pinned 743.
-    /// Charged once per argument list, so flat many-argument calls do not
-    /// accumulate; only nested calls do.
     CallArguments,
-    /// Prefix unary `!`/`void`/`typeof`/`await` operand edge — pinned 9330.
+    /// Additional cost of a construct argument list. It composes with
+    /// NewWithoutArguments so nested new F(...) matches an ordinary call.
+    ConstructArguments,
     Unary,
-    /// `Conditional ? consequent : alternate` edge — pinned 8164.
     Conditional,
-    /// Every arrow function edge (`x =>`) — concise chains fail at 4665.
     Arrow,
-    /// Extra cost of an arrow with a block body beyond [`Self::Arrow`]
-    /// (`x => {` chains fail at 1420).
     ArrowBlockBody,
-    /// Template substitution edge `` ` `` `${` — pinned 635.
     Template,
-    /// Head of an `if`/`while`/`do`/`with`/`for`/`switch` statement without
-    /// its body block. Brace-free heads fail at 3438; a braced body adds
-    /// [`Self::Block`] and the combination fails at ~1675.
     StatementHead,
-    /// Block body entry (`{`), shared by blocks and `try` bodies. Bare
-    /// blocks fail at 3266; `try { } catch` fails at the same depth.
     Block,
-    /// Function/generator body entry (`function f(){`). Nested function
-    /// declarations fail at 2613.
     FunctionBody,
-    /// Bracket member-access key `base[ Expression ]`. Nested computed keys
-    /// (`x[x[…1]]`) recurse through the expression tower and fail at 726.
     MemberAccess,
+    Assignment,
+    Exponentiation,
+    Yield,
+    DynamicImport,
+    Label,
+    NewWithoutArguments,
 }
 
 impl ParserStackFrame {
-    const fn weight(self) -> u64 {
+    const fn eval_weight(self) -> u64 {
         match self {
             Self::Parenthesized => 5_990_191,
             Self::ArrayLiteral => 5_788_365,
             Self::ObjectLiteral => 6_114_011,
             Self::CallArguments => 5_788_365,
+            Self::ConstructArguments => 5_064_576,
             Self::Unary => 460_388,
             Self::Conditional => 526_150,
             Self::Arrow => 920_876,
@@ -131,125 +121,171 @@ impl ParserStackFrame {
             Self::Block => 1_315_055,
             Self::FunctionBody => 1_644_321,
             Self::MemberAccess => 5_924_092,
+            Self::Assignment => 526_150,
+            Self::Exponentiation => 460_388,
+            Self::Yield => 526_175,
+            Self::DynamicImport => 5_787_000,
+            Self::Label => 1_249_626,
+            Self::NewWithoutArguments => 723_500,
+        }
+    }
+
+    /// Direct source is parsed a few C frames nearer QuickJS's recorded stack
+    /// top than eval source. Most observed boundaries move by one level; the
+    /// statement and block families move by four, so their direct weights are
+    /// calibrated independently rather than claiming eval-only exactness.
+    const fn direct_weight(self) -> u64 {
+        match self {
+            Self::Parenthesized => 5_981_848,
+            Self::ArrayLiteral | Self::CallArguments => 5_780_575,
+            Self::ConstructArguments => 5_056_786,
+            Self::Unary | Self::Exponentiation => 459_797,
+            Self::Conditional | Self::Assignment => 525_442,
+            Self::Arrow => 919_693,
+            Self::StatementHead => 1_248_174,
+            Self::Block => 1_313_847,
+            Self::FunctionBody => 1_642_434,
+            Self::MemberAccess => 5_915_932,
+            Self::Yield => 525_466,
+            Self::DynamicImport => 5_779_000,
+            Self::Label => 1_248_000,
+            Self::NewWithoutArguments => 722_500,
+            Self::ObjectLiteral | Self::ArrowBlockBody | Self::Template => self.eval_weight(),
+        }
+    }
+
+    const fn weight(self, context: ParserStackContext) -> u64 {
+        match context {
+            ParserStackContext::Direct => self.direct_weight(),
+            ParserStackContext::Eval => self.eval_weight(),
         }
     }
 }
 
-/// Return a comparable address near the current host stack pointer without
-/// dereferencing it or relying on platform-specific APIs.
 #[inline(never)]
 fn current_stack_address() -> usize {
     let marker = 0_u8;
     std::ptr::from_ref(&marker).addr()
 }
 
-/// Lowest usable stack address for this parse thread. The reserve is added by
-/// the caller.
-///
-/// On Linux this reads the region containing the entry pointer from
-/// `/proc/self/maps`: a reserved worker thread reports its low bound
-/// directly, while the growable main `[stack]` region bottoms out at
-/// `region_high - RLIMIT_STACK`. The parse runs on one thread, so the region
-/// identity cannot change between entry and recursion.
 #[cfg(target_os = "linux")]
-fn stack_floor(entry: usize) -> usize {
-    use std::fs;
-
-    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
-        return fallback_floor(entry);
-    };
-    let mut rlimit_soft = 0_usize;
-    if let Ok(limits) = fs::read_to_string("/proc/self/limits") {
-        for line in limits.lines() {
-            if !line.starts_with("Max stack size") {
-                continue;
-            }
-            // Max stack size  <soft bytes>  <hard bytes>  bytes
-            if let Some(soft) = line.split_whitespace().nth(3)
-                && let Ok(bytes) = soft.parse::<usize>()
-            {
-                rlimit_soft = bytes;
-            }
-        }
+fn parse_linux_stack_metadata(entry: usize, maps: &str, limits: &str) -> LinuxStackMetadata {
+    let rlimit_soft = limits
+        .lines()
+        .find(|line| line.starts_with("Max stack size"))
+        .and_then(|line| line.split_whitespace().nth(3))
+        // 'unlimited' is intentionally None: a growable main-stack VMA's
+        // current low edge is not a real floor in that configuration.
+        .and_then(|soft| soft.parse::<usize>().ok());
+    let region = maps.lines().find_map(|line| {
+        let range = line.split_whitespace().next()?;
+        let (low, high) = range.split_once('-')?;
+        let low = usize::from_str_radix(low, 16).ok()?;
+        let high = usize::from_str_radix(high, 16).ok()?;
+        (entry >= low && entry < high).then_some(StackRegion {
+            low,
+            high,
+            growable_main: line.split_whitespace().last() == Some("[stack]"),
+        })
+    });
+    LinuxStackMetadata {
+        region,
+        rlimit_soft,
     }
-    for line in maps.lines() {
-        let Some(range) = line.split_whitespace().next() else {
-            continue;
-        };
-        let Some((low, high)) = range.split_once('-') else {
-            continue;
-        };
-        let (Ok(low), Ok(high)) = (
-            usize::from_str_radix(low, 16),
-            usize::from_str_radix(high, 16),
-        ) else {
-            continue;
-        };
-        if entry >= low && entry < high {
-            let is_main_stack = line.split_whitespace().last() == Some("[stack]");
-            if is_main_stack && rlimit_soft != 0 {
-                return high.saturating_sub(rlimit_soft);
-            }
-            return low;
-        }
-    }
-    fallback_floor(entry)
 }
 
 #[cfg(target_os = "linux")]
+fn linux_stack_metadata(entry: usize) -> LinuxStackMetadata {
+    LINUX_STACK_METADATA.with(|cached| {
+        if let Some(metadata) = cached.get() {
+            return metadata;
+        }
+        #[cfg(test)]
+        LINUX_STACK_METADATA_LOADS.with(|loads| loads.set(loads.get() + 1));
+        let metadata = match (
+            std::fs::read_to_string("/proc/self/maps"),
+            std::fs::read_to_string("/proc/self/limits"),
+        ) {
+            (Ok(maps), Ok(limits)) => parse_linux_stack_metadata(entry, &maps, &limits),
+            _ => LinuxStackMetadata::default(),
+        };
+        cached.set(Some(metadata));
+        metadata
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn stack_floor(entry: usize) -> usize {
+    let metadata = linux_stack_metadata(entry);
+    let Some(region) = metadata
+        .region
+        .filter(|region| entry >= region.low && entry < region.high)
+    else {
+        return fallback_floor(entry);
+    };
+    if region.growable_main {
+        return metadata.rlimit_soft.map_or_else(
+            || fallback_floor(entry),
+            |limit| region.high.saturating_sub(limit),
+        );
+    }
+    region.low
+}
+
 fn fallback_floor(entry: usize) -> usize {
-    entry.saturating_sub(6 * 1024 * 1024)
+    entry.saturating_sub(PARSER_FALLBACK_GROWTH)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn stack_floor(entry: usize) -> usize {
-    entry.saturating_sub(PARSER_FALLBACK_GROWTH)
+    fallback_floor(entry)
 }
 
-/// Marker returned when a parser recursion limit is reached. The parser maps
-/// it to the pinned `SyntaxError: stack overflow` diagnostic at the current
-/// token; keeping it a dedicated type avoids borrowing `self` to build the
-/// error while the guard itself is mutably borrowed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ParserStackOverflow;
 
-/// Owns the parser's two recursion limits.
 pub(super) struct ParserStackGuard {
-    /// Accumulated weighted logical cost across nested productions.
     logical: u64,
-    /// Lowest address the parser may approach.
     floor: usize,
+    reserve: usize,
+    context: ParserStackContext,
 }
 
 impl ParserStackGuard {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(context: ParserStackContext) -> Self {
         let entry = current_stack_address();
+        let floor = stack_floor(entry);
+        let available = entry.saturating_sub(floor);
         Self {
             logical: 0,
-            floor: stack_floor(entry),
+            floor,
+            reserve: (available / 10).clamp(PARSER_STACK_MIN_RESERVE, PARSER_STACK_RESERVE),
+            context,
         }
     }
 
-    /// Charge one recursive production before descending into it. Returns the
-    /// charged weight so the caller can release it on the way back up a
-    /// successful parse; [`ParserStackOverflow`] means either the weighted
-    /// budget or the physical backstop was reached.
-    pub(super) fn enter(&mut self, frame: ParserStackFrame) -> Result<u64, ParserStackOverflow> {
-        let weight = frame.weight();
-        if self.logical.saturating_add(weight) > PARSER_STACK_BUDGET {
-            return Err(ParserStackOverflow);
+    /// Check at every committed token edge, mirroring QuickJS next_token().
+    /// Keeping this independent of logical weights protects forgotten and
+    /// future recursive productions.
+    pub(super) fn check_physical(&self) -> Result<(), ParserStackOverflow> {
+        let current = current_stack_address();
+        if current <= self.floor.saturating_add(self.reserve) {
+            Err(ParserStackOverflow)
+        } else {
+            Ok(())
         }
-        if current_stack_address() <= self.floor.saturating_add(PARSER_STACK_RESERVE) {
+    }
+
+    pub(super) fn enter(&mut self, frame: ParserStackFrame) -> Result<u64, ParserStackOverflow> {
+        self.check_physical()?;
+        let weight = frame.weight(self.context);
+        if self.logical.saturating_add(weight) > PARSER_STACK_BUDGET {
             return Err(ParserStackOverflow);
         }
         self.logical += weight;
         Ok(weight)
     }
 
-    /// Release the weight charged by a successful [`Self::enter`].
-    ///
-    /// Recursion which returns an error abandons the whole parse, so its
-    /// charge is intentionally left on the guard.
     pub(super) fn leave(&mut self, weight: u64) {
         self.logical = self.logical.saturating_sub(weight);
     }
@@ -259,80 +295,140 @@ impl ParserStackGuard {
 mod tests {
     use super::*;
 
-    #[test]
-    fn weights_reproduce_pinned_first_throw_depths() {
-        // A depth of `d - 1` is accepted and the pinned first-throw depth `d`
-        // is rejected, for every standalone edge.
-        for (frame, pinned_depth) in [
-            (ParserStackFrame::Parenthesized, 718),
-            (ParserStackFrame::ArrayLiteral, 743),
-            (ParserStackFrame::CallArguments, 743),
-            (ParserStackFrame::Unary, 9330),
-            (ParserStackFrame::Conditional, 8164),
-            (ParserStackFrame::Arrow, 4665),
-            (ParserStackFrame::Template, 635),
-            (ParserStackFrame::StatementHead, 3438),
-            (ParserStackFrame::Block, 3266),
-            (ParserStackFrame::FunctionBody, 2613),
-            (ParserStackFrame::MemberAccess, 726),
-        ] {
-            let weight = frame.weight();
-            assert!(
-                (pinned_depth - 1) * weight <= PARSER_STACK_BUDGET,
-                "{frame:?} must accept depth {}",
-                pinned_depth - 1
-            );
-            assert!(
-                pinned_depth * weight > PARSER_STACK_BUDGET,
-                "{frame:?} must reject at the pinned depth {pinned_depth}"
-            );
-        }
-        // A concise arrow plus its block-body surcharge first rejects at the
-        // pinned block-bodied arrow depth 1420.
-        let block_arrow =
-            ParserStackFrame::Arrow.weight() + ParserStackFrame::ArrowBlockBody.weight();
-        assert!(1419 * block_arrow <= PARSER_STACK_BUDGET);
-        assert!(1420 * block_arrow > PARSER_STACK_BUDGET);
-        // A braced statement is a head plus a block and first rejects at 1675.
-        let braced = ParserStackFrame::StatementHead.weight() + ParserStackFrame::Block.weight();
-        assert!(1674 * braced <= PARSER_STACK_BUDGET);
-        assert!(1675 * braced > PARSER_STACK_BUDGET);
-        // The `({a: … })` stress form crosses a paren plus an object edge per
-        // level and first rejects at 355. One outer paren-object plus bare
-        // nested objects (`({` then `a:{` repeated) first rejects at seven
-        // hundred one nested objects: 701 object edges (plus the one outer
-        // paren) are accepted and 702 rejected.
-        let object_value =
-            ParserStackFrame::Parenthesized.weight() + ParserStackFrame::ObjectLiteral.weight();
-        assert!(354 * object_value <= PARSER_STACK_BUDGET);
-        assert!(355 * object_value > PARSER_STACK_BUDGET);
-        let outer = ParserStackFrame::Parenthesized.weight();
-        let object = ParserStackFrame::ObjectLiteral.weight();
-        assert!(outer + 701 * object <= PARSER_STACK_BUDGET);
-        assert!(outer + 702 * object > PARSER_STACK_BUDGET);
+    fn assert_boundary(context: ParserStackContext, frame: ParserStackFrame, depth: u64) {
+        let weight = frame.weight(context);
+        assert!(
+            (depth - 1) * weight <= PARSER_STACK_BUDGET,
+            "{context:?} {frame:?} rejects before {depth} with weight {weight}"
+        );
+        assert!(
+            depth * weight > PARSER_STACK_BUDGET,
+            "{context:?} {frame:?} accepts at {depth} with weight {weight}"
+        );
     }
 
     #[test]
-    fn mixed_nesting_sums_weights_like_one_byte_budget() {
-        let mut guard = ParserStackGuard::new();
-        // Two productions whose frames are each about half the pinned object
-        // depth must exhaust the shared budget well before a pure run.
-        let mut charged = Vec::new();
-        for _ in 0..170 {
-            charged.push(guard.enter(ParserStackFrame::ObjectLiteral).unwrap());
+    fn weighted_boundaries_match_pinned_quickjs() {
+        for (frame, eval_depth, direct_depth) in [
+            (ParserStackFrame::Parenthesized, 718, 719),
+            (ParserStackFrame::ArrayLiteral, 743, 744),
+            (ParserStackFrame::CallArguments, 743, 744),
+            (ParserStackFrame::Unary, 9330, 9342),
+            (ParserStackFrame::Conditional, 8164, 8175),
+            (ParserStackFrame::Arrow, 4665, 4671),
+            (ParserStackFrame::Template, 635, 635),
+            (ParserStackFrame::StatementHead, 3438, 3442),
+            (ParserStackFrame::Block, 3266, 3270),
+            (ParserStackFrame::FunctionBody, 2613, 2616),
+            (ParserStackFrame::MemberAccess, 726, 727),
+            (ParserStackFrame::Assignment, 8164, 8175),
+            (ParserStackFrame::Exponentiation, 9330, 9342),
+            (ParserStackFrame::Label, 3438, 3442),
+            (ParserStackFrame::NewWithoutArguments, 5937, 5945),
+        ] {
+            assert_boundary(ParserStackContext::Eval, frame, eval_depth);
+            assert_boundary(ParserStackContext::Direct, frame, direct_depth);
         }
-        let mut paren_depth = 0_u64;
-        while let Ok(weight) = guard.enter(ParserStackFrame::Parenthesized) {
-            charged.push(weight);
-            paren_depth += 1;
-            assert!(
-                paren_depth <= 718,
-                "mixed nesting was not bounded by the shared budget"
-            );
+        for context in [ParserStackContext::Direct, ParserStackContext::Eval] {
+            let construct = ParserStackFrame::NewWithoutArguments.weight(context)
+                + ParserStackFrame::ConstructArguments.weight(context);
+            let depth = match context {
+                ParserStackContext::Direct => 744,
+                ParserStackContext::Eval => 743,
+            };
+            assert!((depth - 1) * construct <= PARSER_STACK_BUDGET);
+            assert!(depth * construct > PARSER_STACK_BUDGET);
         }
-        assert!(
-            paren_depth < 718,
-            "mixed object+paren nesting must reject before a pure paren run"
+        for (context, depth) in [
+            (ParserStackContext::Eval, 355),
+            (ParserStackContext::Direct, 356),
+        ] {
+            let object = ParserStackFrame::Parenthesized.weight(context)
+                + ParserStackFrame::ObjectLiteral.weight(context);
+            assert!((depth - 1) * object <= PARSER_STACK_BUDGET);
+            assert!(depth * object > PARSER_STACK_BUDGET);
+            let block_arrow = ParserStackFrame::Arrow.weight(context)
+                + ParserStackFrame::ArrowBlockBody.weight(context);
+            assert!(1419 * block_arrow <= PARSER_STACK_BUDGET);
+            assert!(1420 * block_arrow > PARSER_STACK_BUDGET);
+        }
+        let direct_braced = ParserStackFrame::StatementHead.weight(ParserStackContext::Direct)
+            + ParserStackFrame::Block.weight(ParserStackContext::Direct);
+        assert!(1676 * direct_braced <= PARSER_STACK_BUDGET);
+        assert!(1677 * direct_braced > PARSER_STACK_BUDGET);
+        // These forms occur inside a function body, whose one enclosing
+        // logical charge remains live throughout the recursive chain.
+        for (frame, context, depth) in [
+            (ParserStackFrame::Yield, ParserStackContext::Eval, 8160),
+            (ParserStackFrame::Yield, ParserStackContext::Direct, 8171),
+            (
+                ParserStackFrame::DynamicImport,
+                ParserStackContext::Eval,
+                742,
+            ),
+            (
+                ParserStackFrame::DynamicImport,
+                ParserStackContext::Direct,
+                743,
+            ),
+        ] {
+            let weight = frame.weight(context);
+            let enclosing = ParserStackFrame::FunctionBody.weight(context);
+            assert!((depth - 1) * weight + enclosing <= PARSER_STACK_BUDGET);
+            assert!(depth * weight + enclosing > PARSER_STACK_BUDGET);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unlimited_main_stack_is_classified_as_unknown() {
+        let entry = 0x7fff_f000_usize;
+        let metadata = parse_linux_stack_metadata(
+            entry,
+            "7fff0000-80000000 rw-p 0 0 0 [stack]\n",
+            "Max stack size            unlimited            unlimited            bytes\n",
         );
+        assert_eq!(metadata.rlimit_soft, None);
+        assert!(metadata.region.unwrap().growable_main);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stack_metadata_is_loaded_once_per_thread() {
+        std::thread::spawn(|| {
+            LINUX_STACK_METADATA.with(|cached| cached.set(None));
+            LINUX_STACK_METADATA_LOADS.with(|loads| loads.set(0));
+            for _ in 0..8 {
+                let _guard = ParserStackGuard::new(ParserStackContext::Direct);
+            }
+            LINUX_STACK_METADATA_LOADS.with(|loads| assert_eq!(loads.get(), 1));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_backstop_stops_recursion_before_host_stack_overflow() {
+        use crate::engine::compiler::parser::context::Parser;
+        use crate::engine::value::JsString;
+
+        // Nested assignment patterns intentionally have no logical weight.
+        // This test therefore depends on the token-edge physical check: a
+        // mutation which removes that check overflows this 2 MiB thread.
+        let source = format!("var a;{}a{}", "[".repeat(10_000), "]=[]".repeat(10_000));
+        std::thread::Builder::new()
+            .name("parser-physical-backstop".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let error =
+                    Parser::parse(&source, JsString::from_static("<parser-physical-backstop>"))
+                        .expect_err("deep source must reach the parser stack guard");
+                assert_eq!(error.kind(), crate::engine::api::error::ErrorKind::Syntax);
+                assert_eq!(error.message(), "stack overflow");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

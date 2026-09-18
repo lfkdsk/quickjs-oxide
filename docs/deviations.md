@@ -114,11 +114,10 @@ Pinned QuickJS prints `accepted`; Rust prints `SyntaxError`.
   early error.
 - Exact observable: `eval("with({}){".repeat(n) + "0" + "}".repeat(n))`.
   Pinned QuickJS accepts through depth 1674 and first throws at 1675;
-  quickjs-oxide first throws at depth 1674. Every other bounded production is
-  exact (parenthesized 718, array 743, object 355, unary 9330, conditional
-  8164, concise arrow 4665, block arrow 1420, template 635, brace-free
-  if/switch 3438, block/try 3266, braced while/do/if 1675,
-  function/generator body 2613, call/new 743, bare nested objects 701).
+  quickjs-oxide first throws at depth 1674. The calibrated standalone eval
+  families are exact at their pinned boundaries; direct Script/Module roots
+  use separately calibrated weights because pinned QuickJS starts them at a
+  different native-stack depth.
 - Upstream anchor: pinned `next_token()` (`quickjs.c:22719`) bounds parser
   recursion with one physical 1 MiB byte budget; different productions fail
   at different depths purely because their C frames differ in size. The
@@ -130,9 +129,9 @@ Pinned QuickJS prints `accepted`; Rust prints `SyntaxError`.
   mixed nesting summing like the single C byte budget) plus a physical
   host-stack backstop that guarantees a catchable `SyntaxError: stack
   overflow` instead of the previous process abort (SIGABRT). The two engines
-  agree on error type, message, catchability, and process exit code at every
-  depth and on the exact trigger depth for every other production; only this
-  one compound head is one nesting level conservative. Reproducing the exact
+  agree on error type, message, catchability, and process exit code throughout
+  the verification matrix; only this compound head is one nesting level
+  conservative among the calibrated forms. Reproducing the exact
   transient frame residency would require modeling C call-stack frame sizes
   the Rust recursive-descent parser does not share, for no change in the
   JavaScript-visible error contract.
@@ -141,7 +140,9 @@ Pinned QuickJS prints `accepted`; Rust prints `SyntaxError`.
   the error is the same catchable `SyntaxError: stack overflow`, the runtime
   continues afterward, and an uncaught throw still exits 1. No shallow
   program (including all of test262, which contains no such construction) is
-  affected. The library never aborts regardless of host thread stack size.
+  affected. On Linux, the physical backstop also protects unweighted parser
+  recursion on deliberately small caller stacks; exact logical thresholds
+  still require enough host stack to reach the calibrated boundary.
 
 Minimal probe:
 

@@ -112,18 +112,39 @@ impl<'source> Parser<'source> {
         }
 
         if let Some(label_name) = self.label_ahead() {
-            return self.parse_labeled_statement(completion, label_name, position);
+            return self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::Label,
+                move |parser| parser.parse_labeled_statement(completion, label_name, position),
+            );
         }
 
         match self.current().kind {
             TokenKind::Punctuator(Punctuator::LeftBrace) => self.parse_block_statement(completion),
-            TokenKind::Keyword(Keyword::If) => self.parse_if_statement(completion),
-            TokenKind::Keyword(Keyword::While) => self.parse_while_statement(completion, None),
-            TokenKind::Keyword(Keyword::Do) => self.parse_do_while_statement(completion, None),
-            TokenKind::Keyword(Keyword::For) => self.parse_for_statement(completion, None),
-            TokenKind::Keyword(Keyword::Switch) => self.parse_switch_statement(completion),
+            TokenKind::Keyword(Keyword::If) => self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::StatementHead,
+                |parser| parser.parse_if_statement(completion),
+            ),
+            TokenKind::Keyword(Keyword::While) => self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::StatementHead,
+                |parser| parser.parse_while_statement(completion, None),
+            ),
+            TokenKind::Keyword(Keyword::Do) => self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::StatementHead,
+                |parser| parser.parse_do_while_statement(completion, None),
+            ),
+            TokenKind::Keyword(Keyword::For) => self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::StatementHead,
+                |parser| parser.parse_for_statement(completion, None),
+            ),
+            TokenKind::Keyword(Keyword::Switch) => self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::StatementHead,
+                |parser| parser.parse_switch_statement(completion),
+            ),
             TokenKind::Keyword(Keyword::Try) => self.parse_try_statement(completion),
-            TokenKind::Keyword(Keyword::With) => self.parse_with_statement(completion),
+            TokenKind::Keyword(Keyword::With) => self.parse_recursion(
+                crate::engine::compiler::stack_guard::ParserStackFrame::StatementHead,
+                |parser| parser.parse_with_statement(completion),
+            ),
             TokenKind::Keyword(Keyword::Break) => self.parse_loop_jump_statement(false),
             TokenKind::Keyword(Keyword::Continue) => self.parse_loop_jump_statement(true),
             TokenKind::Keyword(Keyword::Function) => {
@@ -269,6 +290,16 @@ impl<'source> Parser<'source> {
     }
 
     pub(in crate::engine::compiler) fn parse_block_statement(
+        &mut self,
+        completion: StatementCompletion,
+    ) -> Result<(), Error> {
+        self.parse_recursion(
+            crate::engine::compiler::stack_guard::ParserStackFrame::Block,
+            |parser| parser.parse_block_statement_inner(completion),
+        )
+    }
+
+    fn parse_block_statement_inner(
         &mut self,
         completion: StatementCompletion,
     ) -> Result<(), Error> {

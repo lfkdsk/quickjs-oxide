@@ -460,6 +460,19 @@ impl<'source> Parser<'source> {
         index: usize,
         goal: LexicalGoal,
     ) -> Result<(), Error> {
+        if self.stack_guard.check_physical().is_err() {
+            // `advance_with_goal` commits the cursor before asking the lexer
+            // for the next token. At the physical limit that token may not
+            // exist yet, so use the last committed span instead of indexing
+            // `current()` past the token cache.
+            let span = self
+                .tokens
+                .get(index)
+                .or_else(|| self.tokens.last())
+                .expect("a Parser always owns its first token")
+                .span;
+            return Err(Error::syntax("stack overflow", source_span(span)));
+        }
         while self.tokens.len() <= index {
             let token = self.lexer.next_token_with_goal(goal).map_err(lex_error)?;
             self.tokens.push(token);
@@ -569,6 +582,26 @@ impl<'source> Parser<'source> {
 
     pub(in crate::engine::compiler) fn syntax_here(&self, message: impl Into<String>) -> Error {
         Error::syntax(message, source_span(self.current().span))
+    }
+
+    /// Charge one recursive grammar production, run `parse`, and release the
+    /// charge on success. Reaching either the weighted parser budget or the
+    /// physical host-stack backstop surfaces the pinned catchable
+    /// `SyntaxError: stack overflow` instead of overflowing the host stack.
+    pub(in crate::engine::compiler) fn parse_recursion<T>(
+        &mut self,
+        frame: crate::engine::compiler::stack_guard::ParserStackFrame,
+        parse: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let weight = self
+            .stack_guard
+            .enter(frame)
+            .map_err(|_| self.syntax_here("stack overflow"))?;
+        let result = parse(self);
+        if result.is_ok() {
+            self.stack_guard.leave(weight);
+        }
+        result
     }
 
     pub(in crate::engine::compiler) fn unsupported_here(

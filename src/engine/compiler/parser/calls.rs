@@ -33,6 +33,13 @@ impl<'source> Parser<'source> {
     pub(in crate::engine::compiler) fn parse_call_arguments(
         &mut self,
     ) -> Result<CallArguments, Error> {
+        self.parse_recursion(
+            crate::engine::compiler::stack_guard::ParserStackFrame::CallArguments,
+            Self::parse_call_arguments_inner,
+        )
+    }
+
+    fn parse_call_arguments_inner(&mut self) -> Result<CallArguments, Error> {
         let mut argument_count = 0_usize;
         while !self.is_punctuator(Punctuator::RightParen) {
             // QuickJS accepts 65,535 encoded fixed arguments and only rejects
@@ -152,7 +159,13 @@ impl<'source> Parser<'source> {
         let (arguments, construct_span) = if self.is_punctuator(Punctuator::LeftParen) {
             let call_span = self.current().span;
             self.advance()?;
-            (self.parse_call_arguments()?, call_span)
+            (
+                self.parse_recursion(
+                    crate::engine::compiler::stack_guard::ParserStackFrame::ConstructArguments,
+                    Self::parse_call_arguments_inner,
+                )?,
+                call_span,
+            )
         } else {
             (CallArguments::Fixed(0), no_arguments_span)
         };
