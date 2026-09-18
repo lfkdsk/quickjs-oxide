@@ -54,15 +54,20 @@ impl ModuleLoader for FileModuleLoader {
 
     fn load(
         &self,
-        _context: &mut quickjs_oxide::engine::api::Context,
+        context: &mut quickjs_oxide::engine::api::Context,
         normalized_name: &JsString,
         attributes: &ModuleImportAttributes,
     ) -> Result<ModuleLoadResult, ModuleLoaderError> {
         let units = normalized_name.utf16_units().collect::<Vec<_>>();
         let filename = String::from_utf16(&units)
             .map_err(|_| ModuleLoaderError::new("module filename is not valid Unicode"))?;
-        let source = std::fs::read(&filename)
-            .map_err(|_| ModuleLoaderError::new(format!("module filename '{filename}'")))?;
+        let source = std::fs::read(&filename).map_err(|_| {
+            module_load_failure(context, &filename).unwrap_or_else(|error| {
+                ModuleLoaderError::new(format!(
+                    "module filename '{filename}': host error construction failed: {error}"
+                ))
+            })
+        })?;
         if import_type_is(attributes, "json5") {
             return Ok(ModuleLoadResult::Json5Bytes(source));
         }
@@ -76,6 +81,23 @@ impl ModuleLoader for FileModuleLoader {
                 .map_err(|error| ModuleLoaderError::new(error.to_string()))?,
         })
     }
+}
+
+/// Build the exact JavaScript `ReferenceError` that upstream's
+/// `js_module_loader` throws when `js_load_file` fails
+/// (`quickjs-libc.c:699`: "could not load module filename '%s'"). The host
+/// loader raises the final text itself, so the engine-side dynamic-import
+/// wrapper is never reached and the message is not doubled. Returning it as
+/// [`ModuleLoaderError::exception`] preserves object identity through rejection.
+fn module_load_failure(
+    context: &mut quickjs_oxide::engine::api::Context,
+    filename: &str,
+) -> Result<ModuleLoaderError, RuntimeError> {
+    let error = context.new_native_error(
+        quickjs_oxide::engine::api::error::NativeErrorKind::Reference,
+        &format!("could not load module filename '{filename}'"),
+    )?;
+    Ok(ModuleLoaderError::exception(error))
 }
 
 fn import_type_is(attributes: &ModuleImportAttributes, expected: &str) -> bool {

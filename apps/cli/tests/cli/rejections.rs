@@ -112,6 +112,20 @@ Possibly unhandled promise rejection: Error: job-boom\n    at <anonymous> (<cmdl
         expected_status: 1,
         expected_stderr: b"Possibly unhandled promise rejection: Error: rethrown\n    at <anonymous> (<cmdline>:1:68)\n",
     },
+    RejectionCase {
+        description: "a throwing then getter omits the resolving-function frame like QuickJS",
+        options: &[],
+        source: "Promise.resolve({get then(){throw new Error(\"gt\")}});",
+        expected_status: 1,
+        expected_stderr: b"Possibly unhandled promise rejection: Error: gt\n    at get then (<cmdline>:1:44)\n    at resolve (native)\n    at <eval> (<cmdline>:1:16)\n",
+    },
+    RejectionCase {
+        description: "a failed dynamic import reports the loader's reference error verbatim",
+        options: &[],
+        source: "import(\"fixture-missing-xyz\");",
+        expected_status: 1,
+        expected_stderr: b"Possibly unhandled promise rejection: ReferenceError: could not load module filename 'fixture-missing-xyz'\n\n",
+    },
 ];
 
 #[test]
@@ -242,4 +256,84 @@ print('entry continues');\n",
     assert_eq!(oxide.status.code(), quickjs.status.code());
     assert_eq!(oxide.stdout, quickjs.stdout);
     assert_eq!(oxide.stderr, quickjs.stderr);
+}
+
+/// A2-1 (cross-family review): a dynamic import of a missing file from a
+/// module must surface the host loader's `ReferenceError`
+/// ("could not load module filename '<name>'") exactly once. Previously the
+/// engine re-wrapped the host message, doubling it. Covers both the rejection
+/// line on stderr and the caught channel (name/message), byte-exact vs qjs.
+#[test]
+fn failed_dynamic_import_message_is_not_doubled() {
+    let fixture = ModuleFixture::new();
+    let entry = fixture.write("entry.mjs", "import('./missing-xyz.mjs');\n");
+
+    // Golden: the phrase "could not load module" appears exactly once (no
+    // double wrap), and the line keeps the normalized specifier.
+    let unhandled = run_file(&[], &entry);
+    assert_eq!(unhandled.status.code(), Some(1));
+    assert!(unhandled.stdout.is_empty());
+    let report = String::from_utf8(unhandled.stderr).unwrap();
+    assert!(
+        report.starts_with("Possibly unhandled promise rejection: "),
+        "{report}"
+    );
+    assert!(
+        report.contains("could not load module filename '"),
+        "{report}"
+    );
+    assert_eq!(
+        report.matches("could not load module").count(),
+        1,
+        "{report}"
+    );
+    // The loader error carries an empty `stack` (it is raised from a host
+    // callback without a JS frame), exactly like pinned qjs, so the report
+    // ends with two newlines.
+    assert!(report.ends_with("missing-xyz.mjs'\n\n"), "{report}");
+
+    // Caught channel: error.name/message survive unchanged, exit 0. The
+    // module goal normalizes the relative specifier to an absolute filename.
+    let missing_path = fixture.root.join("missing-xyz.mjs");
+    let caught_entry = fixture.write(
+        "caught.mjs",
+        "import('./missing-xyz.mjs').catch(function(error) {\n\
+         print(error.name);\n\
+         print(error.message);\n\
+         });\n",
+    );
+    let caught = run_file(&[], &caught_entry);
+    assert!(
+        caught.status.success(),
+        "{}",
+        String::from_utf8_lossy(&caught.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(caught.stdout).unwrap(),
+        format!(
+            "ReferenceError\ncould not load module filename '{}'\n",
+            cli_path(&missing_path)
+        )
+    );
+    assert!(caught.stderr.is_empty());
+
+    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
+        eprintln!("SKIP module-load-failure differential: set QJS_ORACLE to upstream qjs");
+        return;
+    };
+    for path in [&entry, &caught_entry] {
+        let quickjs = Command::new(&oracle)
+            .arg(cli_path(path))
+            .output()
+            .expect("run QuickJS module load failure case");
+        let oxide = run_file(&[], path);
+        assert_eq!(
+            oxide.status.code(),
+            quickjs.status.code(),
+            "{}",
+            path.display()
+        );
+        assert_eq!(oxide.stdout, quickjs.stdout, "{}", path.display());
+        assert_eq!(oxide.stderr, quickjs.stderr, "{}", path.display());
+    }
 }
