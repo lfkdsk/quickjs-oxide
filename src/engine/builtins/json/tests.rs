@@ -515,6 +515,75 @@ fn json_parse_stack_overflow_reports_the_pinned_token_column() {
     );
 }
 
+#[test]
+fn json_module_nesting_cutoff_matches_the_pinned_module_budget() {
+    fn parse_module(
+        runtime: &Runtime,
+        realm: ContextId,
+        depth: usize,
+        bytes: bool,
+        extended: bool,
+    ) -> NativeConversion<Value> {
+        let source = "[".repeat(depth) + "0" + &"]".repeat(depth);
+        let filename = JsString::from_static("fixtures/deep.json");
+        if bytes {
+            if extended {
+                runtime.parse_json5_module_bytes(realm, source.as_bytes(), &filename)
+            } else {
+                runtime.parse_json_module_bytes(realm, source.as_bytes(), &filename)
+            }
+        } else {
+            let source = JsString::try_from_utf8(&source).unwrap();
+            if extended {
+                runtime.parse_json5_module_text(realm, &source, &filename)
+            } else {
+                runtime.parse_json_module_text(realm, &source, &filename)
+            }
+        }
+        .unwrap()
+    }
+
+    // JSON modules reach `JS_ParseJSON` through a shallower pinned C call
+    // path than JSON.parse. Pinned QuickJS therefore accepts 10,911 nested
+    // containers and rejects 10,912, eighteen levels beyond JSON.parse.
+    let runtime = Runtime::new();
+    let mut context = runtime.new_context();
+    for bytes in [false, true] {
+        for extended in [false, true] {
+            for depth in [10_894, 10_911] {
+                assert!(
+                    matches!(
+                        parse_module(&runtime, context.realm, depth, bytes, extended),
+                        NativeConversion::Value(_)
+                    ),
+                    "module rejected depth {depth} (bytes={bytes}, extended={extended})",
+                );
+            }
+
+            let NativeConversion::Throw(Value::Object(error)) =
+                parse_module(&runtime, context.realm, 10_912, bytes, extended)
+            else {
+                panic!("module accepted depth 10,912 (bytes={bytes}, extended={extended})");
+            };
+            for (name, expected) in [
+                ("name", Value::String(JsString::from_static("SyntaxError"))),
+                (
+                    "message",
+                    Value::String(JsString::from_static("stack overflow")),
+                ),
+                ("columnNumber", Value::Int(10_913)),
+            ] {
+                let key = runtime.intern_property_key(name).unwrap();
+                assert_eq!(
+                    context.get_property(&error, &key).unwrap(),
+                    expected,
+                    "{name} differed (bytes={bytes}, extended={extended})",
+                );
+            }
+        }
+    }
+}
+
 fn assert_json5_module_syntax_location(
     source: &str,
     expected_message: &str,

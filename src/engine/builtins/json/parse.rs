@@ -18,8 +18,8 @@ use crate::engine::value::conversion::NativeConversion;
 use crate::engine::value::{JsString, JsStringError, Value};
 use crate::engine::vm::frames::ExplicitBacktraceLocation;
 
-/// Maximum nesting depth of a JSON value: the value-entry check passes at
-/// this depth and fails at the next one.
+/// Maximum nesting depth for `JSON.parse` and `JSON.rawJSON`: the value-entry
+/// check passes at this depth and fails at the next one.
 ///
 /// Pinned QuickJS has no explicit nesting constant. `json_next_token` polls
 /// the platform stack pointer against the one-MiB `JS_DEFAULT_STACK_SIZE`
@@ -39,6 +39,12 @@ use crate::engine::vm::frames::ExplicitBacktraceLocation;
 /// stack or build profile. A pathological payload can never consume the host
 /// call stack and abort the process.
 const MAX_JSON_PARSE_DEPTH: usize = 10_893;
+
+/// JSON modules reach `JS_ParseJSON` through a shallower pinned C call path
+/// and therefore retain eighteen more nested values within the same one-MiB
+/// stack budget. Strict JSON and host-selected extended JSON use the same
+/// parser entry path in pinned QuickJS.
+const MAX_JSON_MODULE_PARSE_DEPTH: usize = 10_911;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JsonContainerKind {
@@ -176,6 +182,7 @@ struct JsonParser<'a> {
     cursor: usize,
     retain_record: bool,
     mode: JsonParseMode,
+    max_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -201,6 +208,7 @@ impl Runtime {
             cursor: 0,
             retain_record,
             mode: JsonParseMode::Strict,
+            max_depth: MAX_JSON_PARSE_DEPTH,
         };
         match parser.parse_document() {
             Ok(value) => Ok(NativeConversion::Value(value)),
@@ -315,10 +323,15 @@ impl Runtime {
                 cursor: 0,
                 retain_record: false,
                 mode,
+                max_depth: MAX_JSON_MODULE_PARSE_DEPTH,
             },
-            JsonModuleSource::Bytes(source) => {
-                JsonParser::try_from_raw_bytes(self, realm, source, mode)?
-            }
+            JsonModuleSource::Bytes(source) => JsonParser::try_from_raw_bytes(
+                self,
+                realm,
+                source,
+                mode,
+                MAX_JSON_MODULE_PARSE_DEPTH,
+            )?,
         };
         match parser.parse_document() {
             Ok((value, None)) => Ok(NativeConversion::Value(value)),
@@ -353,6 +366,7 @@ impl<'a> JsonParser<'a> {
         realm: ContextId,
         source: &'a [u8],
         mode: JsonParseMode,
+        max_depth: usize,
     ) -> Result<Self, RuntimeError> {
         let mut units = Vec::new();
         units
@@ -401,6 +415,7 @@ impl<'a> JsonParser<'a> {
             cursor: 0,
             retain_record: false,
             mode,
+            max_depth,
         })
     }
 
@@ -491,7 +506,7 @@ impl<'a> JsonParser<'a> {
             // column matches the pinned token column exactly.
             let depth = frames.len();
             self.skip_whitespace()?;
-            if depth > MAX_JSON_PARSE_DEPTH {
+            if depth > self.max_depth {
                 return self.syntax("stack overflow");
             }
             if self.current_unit_is_invalid() {
