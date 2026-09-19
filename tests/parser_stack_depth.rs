@@ -337,6 +337,17 @@ fn omitted_right_recursive_forms_match_pinned_eval_boundaries() {
                 repeated("new ", "Object", "", depth)
             )
         });
+        // B8-r4: these compound/transient families previously threw one level
+        // (the with-object head two levels) too early in eval.
+        assert_eval_source_boundary(&mut context, "block-bodied arrow", 1_420, |depth| {
+            repeated("x=>{", "0", "}", depth)
+        });
+        assert_eval_source_boundary(&mut context, "with object head", 1_675, |depth| {
+            repeated("with({}){", "0", "}", depth)
+        });
+        assert_eval_source_boundary(&mut context, "spread array", 743, |depth| {
+            format!("{}[]{}", "[...".repeat(depth), "]".repeat(depth))
+        });
     });
 }
 
@@ -375,6 +386,17 @@ fn direct_source_boundaries_match_pinned_quickjs() {
         });
         assert_direct_source_boundary(&mut context, "yield", 8_171, |depth| {
             format!("function*g(){{{}}}", repeated("yield ", "0", "", depth))
+        });
+        // B8-r4: direct roots previously rejected source pinned accepts for
+        // these three families (review 1089 B-B).
+        assert_direct_source_boundary(&mut context, "block-bodied arrow", 1_422, |depth| {
+            repeated("x=>{", "0", "}", depth)
+        });
+        assert_direct_source_boundary(&mut context, "with object head", 1_677, |depth| {
+            repeated("with({}){", "0", "}", depth)
+        });
+        assert_direct_source_boundary(&mut context, "spread array", 744, |depth| {
+            format!("{}[]{}", "[...".repeat(depth), "]".repeat(depth))
         });
     });
 }
@@ -477,15 +499,102 @@ fn unlimited_stack_limit_accepts_shallow_source() {
         return;
     }
 
+    // Use `&&` (not `;`) so a sandbox which forbids raising the limit makes
+    // the child fail instead of passing vacuously (review 1089 N-6).
     let status = std::process::Command::new("bash")
         .args([
             "-c",
-            "ulimit -s unlimited; exec \"$1\" --exact unlimited_stack_limit_accepts_shallow_source --nocapture",
+            "ulimit -s unlimited && exec \"$1\" --exact unlimited_stack_limit_accepts_shallow_source --nocapture",
             "parser-stack-unlimited",
         ])
         .arg(std::env::current_exe().expect("locate parser_stack_depth test binary"))
         .env(CHILD_ENV, "1")
         .status()
         .expect("run parser test child with RLIMIT_STACK=unlimited");
-    assert!(status.success(), "unlimited-stack child failed: {status}");
+    assert!(
+        status.success(),
+        "unlimited-stack child failed (ulimit refused or parse rejected): {status}"
+    );
+}
+
+/// Locate the committed `parser_main_thread_stack_probe` example relative to
+/// the integration-test binary (`target/<profile>/deps/..`).
+#[cfg(target_os = "linux")]
+fn main_thread_probe() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("locate test binary");
+    let target_dir = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("test binary lives under target/<profile>/deps");
+    target_dir
+        .join("examples")
+        .join("parser_main_thread_stack_probe")
+}
+
+#[cfg(target_os = "linux")]
+fn run_main_thread_probe(stack_limit: &str, args: &[&str]) -> std::process::Output {
+    let probe = main_thread_probe();
+    assert!(
+        probe.exists(),
+        "build the parser_main_thread_stack_probe example first: {probe:?}"
+    );
+    // `set -e` semantics + `exec`: if `ulimit` cannot be applied the probe is
+    // not started, so the test fails rather than masking a sandbox refusal.
+    let command = format!(
+        "ulimit -s {limit} && exec \"$0\" {args}",
+        limit = stack_limit,
+        args = args.join(" ")
+    );
+    std::process::Command::new("bash")
+        .args(["-c", &command])
+        .arg(&probe)
+        .output()
+        .expect("spawn main-thread stack probe")
+}
+
+/// B8-r4 B-A: a release/debug library running on the real main thread must
+/// surface the parser overflow as a catchable SyntaxError even when the parse
+/// begins several hundred KiB to over a MiB deeper than the first parse that
+/// populated the per-thread `/proc/self/maps` cache. The old guard compared
+/// against a stale cached VMA low edge and aborted (SIGABRT, rc=134).
+#[cfg(target_os = "linux")]
+#[test]
+fn main_thread_parse_from_deeper_native_frames_never_aborts() {
+    for stack_limit in ["4096", "8192"] {
+        for frames in ["0", "1", "4", "8", "16"] {
+            let output = run_main_thread_probe(stack_limit, &["native", frames, "6000"]);
+            assert!(
+                output.status.success(),
+                "limit={stack_limit} frames={frames} aborted: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("probe utf8");
+            assert_eq!(
+                stdout.trim(),
+                "SyntaxError:stack overflow",
+                "limit={stack_limit} frames={frames} must yield a catchable overflow"
+            );
+        }
+    }
+}
+
+/// Under RLIMIT_STACK=unlimited there is no known stack extent; the deep-native
+/// main-thread parse must still be a catchable SyntaxError rather than aborting
+/// (the M5 regression: reverting to the stale `region.low` floor aborts here).
+#[cfg(target_os = "linux")]
+#[test]
+fn main_thread_unlimited_stack_deep_native_parse_is_catchable() {
+    for frames in ["0", "4", "16"] {
+        let output = run_main_thread_probe("unlimited", &["native", frames, "6000"]);
+        assert!(
+            output.status.success(),
+            "unlimited frames={frames} aborted: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("probe utf8").trim(),
+            "SyntaxError:stack overflow",
+            "unlimited frames={frames}",
+        );
+    }
 }

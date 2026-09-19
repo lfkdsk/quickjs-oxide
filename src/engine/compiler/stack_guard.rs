@@ -102,6 +102,16 @@ pub(super) enum ParserStackFrame {
     DynamicImport,
     Label,
     NewWithoutArguments,
+    /// Object literal used as the immediate discriminant of a `with (head)`.
+    /// In pinned QuickJS this transient occupies a smaller C frame than an
+    /// ordinary object literal; modelling it separately keeps the nested
+    /// `with({}){` boundary at the pinned depth instead of charging it like
+    /// `({...})`.
+    WithObjectHead,
+    /// Array literal reached as the immediate operand of a spread element
+    /// (`[...[...]]`). Pinned's frame for this chain is marginally smaller
+    /// than an ordinary array literal, which admits one extra nesting level.
+    SpreadElement,
 }
 
 impl ParserStackFrame {
@@ -127,6 +137,14 @@ impl ParserStackFrame {
             Self::DynamicImport => 5_787_000,
             Self::Label => 1_249_626,
             Self::NewWithoutArguments => 723_500,
+            // With SH charged at the body token, the object-head transient
+            // (1674 surrounding statement/block pairs live) must stay below
+            // 2,297,290 in eval so the 1675th head fits and the body block
+            // trips first, matching pinned's body-token column.
+            Self::WithObjectHead => 2_200_000,
+            // `[...[...[]]]` admits one more nesting (pinned throw 743) than
+            // the generic array weight (742).
+            Self::SpreadElement => 5_776_674,
         }
     }
 
@@ -150,7 +168,19 @@ impl ParserStackFrame {
             Self::DynamicImport => 5_779_000,
             Self::Label => 1_248_000,
             Self::NewWithoutArguments => 722_500,
-            Self::ObjectLiteral | Self::ArrowBlockBody | Self::Template => self.eval_weight(),
+            // Nested `with({}){` in a direct root: with SH charged at the body
+            // token, 1676 statement/block pairs are live when the 1677th head
+            // object is entered, leaving 1,020,100 of budget. A weight below
+            // that lets the head parse and lets the body block trip first at
+            // the pinned 1677 depth/column.
+            Self::WithObjectHead => 1_000_000,
+            // `[...[...[]]]` direct boundary is 744, one deeper than the
+            // generic array weight (743).
+            Self::SpreadElement => 5_768_915,
+            // A braced arrow body (`x=>{`) starts one frame nearer the budget
+            // edge in a direct root, giving the pinned 1422 first-throw depth.
+            Self::ArrowBlockBody => 2_101_700,
+            Self::ObjectLiteral | Self::Template => self.eval_weight(),
         }
     }
 
@@ -217,19 +247,32 @@ fn linux_stack_metadata(entry: usize) -> LinuxStackMetadata {
 #[cfg(target_os = "linux")]
 fn stack_floor(entry: usize) -> usize {
     let metadata = linux_stack_metadata(entry);
-    let Some(region) = metadata
-        .region
-        .filter(|region| entry >= region.low && entry < region.high)
-    else {
+    let Some(region) = metadata.region else {
         return fallback_floor(entry);
     };
     if region.growable_main {
-        return metadata.rlimit_soft.map_or_else(
-            || fallback_floor(entry),
-            |limit| region.high.saturating_sub(limit),
-        );
+        // A main thread's `[stack]` VMA grows downward as the program touches
+        // deeper frames, so its cached low edge is only where the mapping
+        // ended when `/proc/self/maps` was first read — never a real floor.
+        // A host which creates its runtime near the top and later evaluates
+        // source from a much deeper native callback (host recursion, native
+        // getters) legitimately runs below that cached edge. Only the fixed
+        // high edge and the RLIMIT_STACK extent describe the real extent;
+        // reject the (effectively impossible) entry at or above the high edge.
+        if entry < region.high {
+            // 'unlimited' (rlimit_soft == None) has no known downward extent,
+            // so the entry-relative fallback below applies there too.
+            return metadata.rlimit_soft.map_or_else(
+                || fallback_floor(entry),
+                |limit| region.high.saturating_sub(limit),
+            );
+        }
+    } else if entry >= region.low && entry < region.high {
+        // Fixed-size thread stacks (and the main thread on non-Linux hosts)
+        // have a stable low edge for the whole thread lifetime.
+        return region.low;
     }
-    region.low
+    fallback_floor(entry)
 }
 
 fn fallback_floor(entry: usize) -> usize {
@@ -347,15 +390,54 @@ mod tests {
                 + ParserStackFrame::ObjectLiteral.weight(context);
             assert!((depth - 1) * object <= PARSER_STACK_BUDGET);
             assert!(depth * object > PARSER_STACK_BUDGET);
+        }
+        // Braced arrow body (`x=>{`): eval first throws at 1420, a direct
+        // Script/Module root starts one frame nearer the budget edge and first
+        // throws at 1422.
+        for (context, depth) in [
+            (ParserStackContext::Eval, 1420),
+            (ParserStackContext::Direct, 1422),
+        ] {
             let block_arrow = ParserStackFrame::Arrow.weight(context)
                 + ParserStackFrame::ArrowBlockBody.weight(context);
-            assert!(1419 * block_arrow <= PARSER_STACK_BUDGET);
-            assert!(1420 * block_arrow > PARSER_STACK_BUDGET);
+            assert!(
+                (depth - 1) * block_arrow <= PARSER_STACK_BUDGET,
+                "block arrow {context:?} must accept {depth}",
+            );
+            assert!(
+                depth * block_arrow > PARSER_STACK_BUDGET,
+                "block arrow {context:?} must throw at {depth}",
+            );
         }
         let direct_braced = ParserStackFrame::StatementHead.weight(ParserStackContext::Direct)
             + ParserStackFrame::Block.weight(ParserStackContext::Direct);
         assert!(1676 * direct_braced <= PARSER_STACK_BUDGET);
         assert!(1677 * direct_braced > PARSER_STACK_BUDGET);
+        // `with({}){` in a direct root: the smaller transient object-head
+        // charge accepts through 1676, then the statement/block frames throw
+        // at 1677. Eval keeps the approved 1674 deviation.
+        let with_head = ParserStackFrame::WithObjectHead.weight(ParserStackContext::Direct);
+        // `with({}){` in a direct root: SH is charged at the body token, so
+        // while the 1677th head object is entered only 1676 pairs are live.
+        // Its smaller transient charge must fit; the body block then trips at
+        // the pinned 1677 depth. Eval follows the same deferred-head shape.
+        assert!(1676 * direct_braced + with_head <= PARSER_STACK_BUDGET);
+        assert!(1677 * direct_braced > PARSER_STACK_BUDGET);
+        // Spread chains `[...[...[]]]`: the outer array is an ordinary array,
+        // every nested operand is a spread element. Eval first throws at 743,
+        // a direct root at 744.
+        for (context, depth, plain, spread) in [
+            (ParserStackContext::Eval, 743, 5_788_365, 5_776_674_u64),
+            (ParserStackContext::Direct, 744, 5_780_575, 5_768_915_u64),
+        ] {
+            assert_eq!(
+                ParserStackFrame::SpreadElement.weight(context),
+                spread,
+                "spread element weight {context:?}",
+            );
+            assert!(plain + (depth - 1) * spread <= PARSER_STACK_BUDGET);
+            assert!(plain + depth * spread > PARSER_STACK_BUDGET);
+        }
         // These forms occur inside a function body, whose one enclosing
         // logical charge remains live throughout the recursive chain.
         for (frame, context, depth) in [

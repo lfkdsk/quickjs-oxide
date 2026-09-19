@@ -604,6 +604,29 @@ impl<'source> Parser<'source> {
         result
     }
 
+    /// Charge a recursive production *after* its fixed head has been consumed.
+    ///
+    /// Pinned QuickJS checks its C stack inside `next_token`; for headed
+    /// statements (`if`, `while`, `with`, labelled statements, …) the failing
+    /// call is the one that fetches the first controlled-body token. Entering
+    /// the weight at that point — rather than at the head keyword — keeps the
+    /// same set of simultaneously live frames (so first-throw depths are
+    /// unchanged) while reporting the overflow at the body token, matching the
+    /// pinned line/column. Pair every `Ok` weight with
+    /// [`Self::leave_recursion_weight`] once the body finishes.
+    pub(in crate::engine::compiler) fn enter_recursion_weight_at_current(
+        &mut self,
+        frame: crate::engine::compiler::stack_guard::ParserStackFrame,
+    ) -> Result<u64, Error> {
+        self.stack_guard
+            .enter(frame)
+            .map_err(|_| self.syntax_here("stack overflow"))
+    }
+
+    pub(in crate::engine::compiler) fn leave_recursion_weight(&mut self, weight: u64) {
+        self.stack_guard.leave(weight);
+    }
+
     pub(in crate::engine::compiler) fn unsupported_here(
         &self,
         message: impl Into<String>,

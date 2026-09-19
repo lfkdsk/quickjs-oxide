@@ -113,10 +113,13 @@ impl<'source> Parser<'source> {
                 self.expect_punctuator(Punctuator::RightParen)?;
             }
             TokenKind::Punctuator(Punctuator::LeftBrace) => {
-                self.parse_recursion(
-                    crate::engine::compiler::stack_guard::ParserStackFrame::ObjectLiteral,
-                    Self::parse_object_literal,
-                )?;
+                let frame = if self.with_head_object_pending {
+                    self.with_head_object_pending = false;
+                    crate::engine::compiler::stack_guard::ParserStackFrame::WithObjectHead
+                } else {
+                    crate::engine::compiler::stack_guard::ParserStackFrame::ObjectLiteral
+                };
+                self.parse_recursion(frame, Self::parse_object_literal)?;
             }
             TokenKind::Punctuator(Punctuator::LeftBracket) => {
                 self.parse_recursion(
@@ -154,10 +157,7 @@ impl<'source> Parser<'source> {
                 self.parse_class_expression()?;
             }
             TokenKind::Keyword(Keyword::New) => {
-                self.parse_recursion(
-                    crate::engine::compiler::stack_guard::ParserStackFrame::NewWithoutArguments,
-                    Self::parse_new_expression,
-                )?;
+                self.parse_new_expression()?;
             }
             TokenKind::Keyword(Keyword::Super) => {
                 self.parse_super_property(token.span)?;
@@ -175,10 +175,7 @@ impl<'source> Parser<'source> {
                 )));
             }
             TokenKind::Keyword(Keyword::Import) => {
-                self.parse_recursion(
-                    crate::engine::compiler::stack_guard::ParserStackFrame::DynamicImport,
-                    |parser| parser.parse_import_expression(token.span, import_call_allowed),
-                )?;
+                self.parse_import_expression(token.span, import_call_allowed)?;
             }
             TokenKind::Keyword(Keyword::Yield)
                 if matches!(
@@ -384,7 +381,20 @@ impl<'source> Parser<'source> {
         while !self.is_punctuator(Punctuator::RightBracket) {
             if self.is_punctuator(Punctuator::Ellipsis) {
                 self.advance_expression_start()?;
-                self.parse_assignment_allow_in()?;
+                // A `[` that is the *immediate* spread operand is a spread
+                // array, whose pinned C frame is marginally smaller than an
+                // ordinary array literal. A deeper bracket reached through any
+                // other production (e.g. the argument in `[...f([])]`) stays a
+                // normal array, so the branch is on the current token rather
+                // than a marker that nested parsing could observe.
+                if self.is_punctuator(Punctuator::LeftBracket) {
+                    self.parse_recursion(
+                        crate::engine::compiler::stack_guard::ParserStackFrame::SpreadElement,
+                        Self::parse_array_literal,
+                    )?;
+                } else {
+                    self.parse_assignment_allow_in()?;
+                }
                 self.emit_instruction(Instruction::Append)?;
             } else {
                 need_length = true;

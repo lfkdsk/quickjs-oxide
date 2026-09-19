@@ -278,6 +278,12 @@ pub(in crate::engine::compiler) struct Parser<'source> {
     /// Shared logical and physical recursion guard for this parse.
     pub(in crate::engine::compiler) stack_guard:
         crate::engine::compiler::stack_guard::ParserStackGuard,
+    /// Set only while parsing the head expression of a `with (head)` that
+    /// immediately begins with `({`. The first object literal reached (the
+    /// head's own discriminant) then takes the smaller `WithObjectHead`
+    /// charge; nested braces and every other head parse as ordinary object
+    /// literals. Always reset when the head expression returns.
+    pub(in crate::engine::compiler) with_head_object_pending: bool,
 }
 
 pub(in crate::engine::compiler) enum RootCompileContext {

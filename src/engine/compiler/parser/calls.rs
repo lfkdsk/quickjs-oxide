@@ -141,6 +141,19 @@ impl<'source> Parser<'source> {
         // QuickJS parses the constructor head with calls disabled but member
         // suffixes enabled. The following `(` therefore belongs to this `new`,
         // while calls after the completed construction remain postfix calls.
+        // Charge after the `new` keyword (and the `new.target` branch above)
+        // so the overflow is reported at the constructor token like pinned.
+        let weight = self.enter_recursion_weight_at_current(
+            crate::engine::compiler::stack_guard::ParserStackFrame::NewWithoutArguments,
+        )?;
+        let result = self.parse_new_constructor_tail();
+        if result.is_ok() {
+            self.leave_recursion_weight(weight);
+        }
+        result
+    }
+
+    fn parse_new_constructor_tail(&mut self) -> Result<(), Error> {
         self.parse_primary(false)?;
         loop {
             if self.is_punctuator(Punctuator::OptionalChain) {
@@ -350,6 +363,20 @@ impl<'source> Parser<'source> {
             return Err(self.syntax_here("invalid use of 'import()'"));
         }
 
+        // Charge after `import(` so the overflow is reported at the operand
+        // token like pinned's next_token, then release across the argument
+        // list and closing paren.
+        let weight = self.enter_recursion_weight_at_current(
+            crate::engine::compiler::stack_guard::ParserStackFrame::DynamicImport,
+        )?;
+        let result = self.parse_import_arguments(import_span);
+        if result.is_ok() {
+            self.leave_recursion_weight(weight);
+        }
+        result
+    }
+
+    fn parse_import_arguments(&mut self, import_span: Span) -> Result<(), Error> {
         // ImportCall accepts one required AssignmentExpression and at most one
         // options AssignmentExpression. Spread is not part of this grammar;
         // ordinary expression parsing therefore supplies QuickJS's exact

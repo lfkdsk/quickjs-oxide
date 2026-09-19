@@ -360,6 +360,7 @@ mod tests {
             stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(
                 crate::engine::compiler::stack_guard::ParserStackContext::Direct,
             ),
+            with_head_object_pending: false,
         };
         parser.push_scope(ScopeKind::ClassPrivate);
         parser
