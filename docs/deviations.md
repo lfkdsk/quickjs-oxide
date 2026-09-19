@@ -186,6 +186,20 @@ Three distinct, measurable context shifts remain:
    the error message, name, depth and exit code match and only the uncaught
    column differs.
 
+5. **Spread chains with a non-array leaf (one-level conservative, pre-existing;
+   confirmed unchanged by B8-r5).** Nested `[...` chains whose innermost leaf
+   is not an array literal (`[...[...1]]`, leaf `1`) first throw one level
+   later in oxide than pinned: **eval 744 vs 743**, **direct root 745 vs
+   744** (the bracketed-leaf form `[...[...[]]]` is exact at eval 743 / direct
+   744). The weighted model ties one charge to entering the innermost array
+   primary; pinned's `next_token` check fires on the same token-edge count
+   regardless of the leaf shape, so the non-array leaf leaves one frame of
+   headroom in the model. The shift is conservative (oxide accepts one more
+   nesting level, then throws the identical catchable
+   `SyntaxError: stack overflow`; name/message/exit code match), predates
+   B8-r4 and is byte-identical on `2372d2c2` and the B8-r5 branch; no shallow
+   program is affected.
+
 - Rationale: the weighted budget plus physical backstop already guarantee the
   parity.md:77 contract — a catchable `SyntaxError: stack overflow`, never a
   process abort — for every production and entry point, and all *standalone*
@@ -204,6 +218,19 @@ Three distinct, measurable context shifts remain:
   program (including all of test262) is affected. Reproduction vectors and the
   full 63-family × five-entry matrices are recorded under
   `findings/b8r4/` (`boundary_{eval,cmdline,direct,module,function}.txt`).
+  - 2026-09-19 B8-r4 interim regression, closed by B8-r5 (task 1178): while
+    charging the immediate spread-array operand, the operand was parsed by a
+    direct `parse_array_literal` call instead of the full AssignmentExpression,
+    so shallow continuations pinned accepts (`[...[1].map(x=>x)]`,
+    `[...[1] || []]`, `[...[1] ? [2] : [3]]`) were rejected with
+    `expecting ']'`. That contradicted an earlier draft of this bullet; it was
+    not an accepted deviation and is now fixed. The spread operand again goes
+    through `parse_assignment_allow_in` (mirroring `js_parse_assign_expr`,
+    quickjs.c:25732-25738), and only the leading `[` primary swaps in the
+    smaller `SpreadElement` charge via a one-shot parser flag, preserving the
+    pinned spread-array boundaries (eval 743, direct 744). Regression coverage
+    lives in `tests/spread_operand.rs` (byte-compared with pinned under
+    `QJS_ORACLE`).
 
 Minimal probes:
 
