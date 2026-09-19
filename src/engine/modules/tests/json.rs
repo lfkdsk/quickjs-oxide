@@ -261,10 +261,11 @@ fn json_module_import_shapes_keep_the_documented_fixed_logical_budget() {
 }
 
 #[test]
-fn json_module_import_boundary_preserves_pinned_malformed_diagnostics() {
-    // Exercise the loader integration point as well as the parser-level test:
-    // direct, nested, and dynamic imports must all retain the malformed leaf
-    // diagnostic at the module budget boundary.
+fn json_module_import_shapes_preserve_malformed_diagnostics_at_the_oxide_boundary() {
+    // Exercise the loader integration point as well as the parser-level test.
+    // All Oxide loader shapes share the fixed logical module budget and must
+    // retain the malformed leaf diagnostic at that boundary. Pinned QuickJS's
+    // context-dependent nested/dynamic cutoffs are recorded as deviations.
     for shape in ["direct-static", "nested-static", "dynamic"] {
         for (label, suffix, expected) in [
             ("identifier", "x", "unexpected token: 'x'"),

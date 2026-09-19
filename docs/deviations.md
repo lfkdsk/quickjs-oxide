@@ -186,13 +186,23 @@ initial snapshot. Both paths are pinned in
 
   Lowering pinned `qjs` to `--stack-size 512k` makes depth 5,432 the last
   accepted try-wrapped parse and depth 5,433 the first failure (column 5,434);
-  raising it to `2M` accepts at least depth 15,002. Oxide
-  currently has no `--stack-size` option or `JS_SetMaxStackSize` facade, so its
-  fixed counts do not track either change. Boundary-depth malformed, EOF, and
-  unexpected tokens are not part of this deviation: Oxide preserves their
-  ordinary pinned lexical/syntax diagnostics before applying the logical stack
-  error to a successfully lexed leaf. All remaining threshold differences in
-  this table continue to block an unqualified parity claim.
+  raising it to `2M` accepts at least depth 15,002. Oxide currently has no
+  `--stack-size` option or `JS_SetMaxStackSize` facade, so its fixed counts do
+  not track either change. Oxide does preserve QuickJS's local token ordering
+  at the calibrated parse and module boundaries: an EOF, malformed, or
+  unexpected leaf is diagnosed before the stack error that follows a
+  successfully lexed leaf. The review's 12 try-wrapped `JSON.parse` probes at
+  depth 10,894 and two direct-static module probes at depth 10,912 are therefore
+  byte-identical.
+  This does not make malformed diagnostics context-independent. Once the
+  engines reach different stack cutoffs, one may fail before reaching the bad
+  leaf: identifier/EOF probes first differ at depth 10,895 for bare parse,
+  10,888 for a one-function caller, 10,886 for `JSON.parse.call`, 10,907 for a
+  nested-static module, and 10,913 for dynamic imports. The matching
+  direct-static calibration keeps identifier/EOF results byte-identical across
+  the probed depths 10,909-10,914. The other diagnostic-priority differences,
+  along with every threshold difference in the table, are part of this open
+  deviation and continue to block an unqualified parity claim.
 
 Minimal deep-call probe:
 
