@@ -25,13 +25,15 @@ use crate::engine::vm::frames::ExplicitBacktraceLocation;
 /// the platform stack pointer against the one-MiB `JS_DEFAULT_STACK_SIZE`
 /// budget while advancing every token (`quickjs.c` `json_next_token`), and
 /// the recursive `json_parse_value` consumes one C frame per open container.
-/// On the pinned 2026-06-04 x86-64 artifact that budget bottoms out with
-/// 10,894 live value frames; the value entered at nesting depth 10,894 is
-/// the first one whose token advance raises the catchable
+/// On the pinned 2026-06-04 x86-64 artifact, a try-wrapped top-level call
+/// bottoms out with 10,894 live value frames; the value entered at nesting
+/// depth 10,894 is the first one whose token advance raises the catchable
 /// `SyntaxError("stack overflow")`. A leaf nested in `n` arrays therefore
 /// fails at `n = 10_894`, while a chain of `n` *empty* arrays reaches only
 /// depth `n - 1` and survives to `n = 10_895`. Arrays and objects share one
-/// frame shape, so both obey the same count.
+/// frame shape, so both obey the same count in that calibration shape. Pinned
+/// QuickJS's exact cutoff shifts with the active native call stack; the fixed
+/// logical-budget differences are recorded in `docs/deviations.md`.
 ///
 /// The descent in `parse_document` is iterative: each open container lives in
 /// a heap-allocated [`JsonContainerFrame`], so this number is a logical parity
@@ -40,10 +42,13 @@ use crate::engine::vm::frames::ExplicitBacktraceLocation;
 /// call stack and abort the process.
 const MAX_JSON_PARSE_DEPTH: usize = 10_893;
 
-/// JSON modules reach `JS_ParseJSON` through a shallower pinned C call path
-/// and therefore retain eighteen more nested values within the same one-MiB
-/// stack budget. Strict JSON and host-selected extended JSON use the same
-/// parser entry path in pinned QuickJS.
+/// A direct static JSON import from the entry module reaches `JS_ParseJSON`
+/// through a shallower pinned C call path and therefore retains eighteen more
+/// nested values than the try-wrapped `JSON.parse` calibration within the same
+/// one-MiB stack budget. Nested and dynamic imports have different pinned
+/// cutoffs; the fixed logical-budget differences are recorded in
+/// `docs/deviations.md`. Strict JSON and host-selected extended JSON use the
+/// same Oxide parser entry path.
 const MAX_JSON_MODULE_PARSE_DEPTH: usize = 10_911;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,39 +502,50 @@ impl<'a> JsonParser<'a> {
                 continue;
             }
 
-            // Parse one value nested beneath every open container. This is
-            // the counterpart of entering `json_parse_value` at this depth:
-            // the pinned platform-stack check that trips runs while advancing
-            // this value's token, and leaves the diagnostic pointer on that
-            // same token (the opener for a container, the leaf token
-            // otherwise). The check sits after whitespace skipping, so its
-            // column matches the pinned token column exactly.
+            // Parse one value nested beneath every open container. Pinned
+            // QuickJS has already lexed this token before recursively entering
+            // `json_parse_value`. A container opener immediately advances to
+            // its first child, so an over-budget opener reports stack overflow.
+            // A leaf is different: its lexer error (including EOF or an
+            // unexpected token) has already won before the recursive call.
+            // Only a successfully lexed leaf advances again and observes the
+            // exhausted stack. Preserve that diagnostic ordering while keeping
+            // the descent itself iterative.
             let depth = frames.len();
             self.skip_whitespace()?;
-            if depth > self.max_depth {
-                return self.syntax("stack overflow");
-            }
             if self.current_unit_is_invalid() {
                 return self.syntax("unexpected character");
             }
             let Some(unit) = self.peek() else {
                 return self.syntax("Unexpected end of JSON input");
             };
+            let over_depth_budget = depth > self.max_depth;
             match unit {
                 unit if unit == u16::from(b'{') => {
+                    if over_depth_budget {
+                        return self.syntax("stack overflow");
+                    }
                     if self.open_object_frame(&mut frames)? {
                         let frame = frames.pop().expect("closed container has no frame");
                         pending = Some(self.complete_container_frame(frame));
                     }
                 }
                 unit if unit == u16::from(b'[') => {
+                    if over_depth_budget {
+                        return self.syntax("stack overflow");
+                    }
                     if self.open_array_frame(&mut frames)? {
                         let frame = frames.pop().expect("closed container has no frame");
                         pending = Some(self.complete_container_frame(frame));
                     }
                 }
                 _ => {
-                    pending = Some(self.parse_leaf_value(unit)?);
+                    let token_start = self.cursor;
+                    let leaf = self.parse_leaf_value(unit)?;
+                    if over_depth_budget {
+                        return self.syntax_at(token_start, "stack overflow");
+                    }
+                    pending = Some(leaf);
                 }
             }
         };
