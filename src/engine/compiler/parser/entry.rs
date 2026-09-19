@@ -219,6 +219,7 @@ impl<'source> Parser<'source> {
             pending_unsupported: None,
             stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(stack_context),
             with_head_object_pending: false,
+            spread_array_operand_pending: false,
             module: is_module.then(module::IrModule::default),
             module_declaration_export: ModuleDeclarationExport::None,
             module_declaration_export_target: None,

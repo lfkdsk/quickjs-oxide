@@ -284,6 +284,16 @@ pub(in crate::engine::compiler) struct Parser<'source> {
     /// charge; nested braces and every other head parse as ordinary object
     /// literals. Always reset when the head expression returns.
     pub(in crate::engine::compiler) with_head_object_pending: bool,
+    /// Set only for the operand expression of a spread element whose
+    /// *immediate* first token is `[` (`[...[…]]`). Pinned QuickJS always
+    /// parses the complete AssignmentExpression after `...`
+    /// (`js_parse_assign_expr`, quickjs.c:25732-25738); this flag only swaps
+    /// the leading array primary's charge to the marginally smaller
+    /// `SpreadElement` frame, so postfix/member, binary/logical and
+    /// conditional continuations still parse normally. It is consumed once by
+    /// that leading primary, cleared when the head is an arrow or assignment
+    /// pattern instead, and always reset when the spread operand returns.
+    pub(in crate::engine::compiler) spread_array_operand_pending: bool,
 }
 
 pub(in crate::engine::compiler) enum RootCompileContext {

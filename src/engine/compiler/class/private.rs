@@ -361,6 +361,7 @@ mod tests {
                 crate::engine::compiler::stack_guard::ParserStackContext::Direct,
             ),
             with_head_object_pending: false,
+            spread_array_operand_pending: false,
         };
         parser.push_scope(ScopeKind::ClassPrivate);
         parser

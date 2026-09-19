@@ -510,6 +510,7 @@ fn parameter_assignment_prescan_retains_quickjs_bits_at_the_depth_bound() {
             crate::engine::compiler::stack_guard::ParserStackContext::Direct,
         ),
         with_head_object_pending: false,
+        spread_array_operand_pending: false,
     };
 
     assert_eq!(parser.parenthesized_parameter_has_assignment(), Some(true));

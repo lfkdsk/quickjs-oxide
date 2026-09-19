@@ -122,10 +122,17 @@ impl<'source> Parser<'source> {
                 self.parse_recursion(frame, Self::parse_object_literal)?;
             }
             TokenKind::Punctuator(Punctuator::LeftBracket) => {
-                self.parse_recursion(
-                    crate::engine::compiler::stack_guard::ParserStackFrame::ArrayLiteral,
-                    Self::parse_array_literal,
-                )?;
+                // The immediate array operand of a spread element occupies
+                // pinned's marginally smaller spread-array frame; every other
+                // bracket (including continuations after the leading array)
+                // is an ordinary array literal.
+                let frame = if self.spread_array_operand_pending {
+                    self.spread_array_operand_pending = false;
+                    crate::engine::compiler::stack_guard::ParserStackFrame::SpreadElement
+                } else {
+                    crate::engine::compiler::stack_guard::ParserStackFrame::ArrayLiteral
+                };
+                self.parse_recursion(frame, Self::parse_array_literal)?;
             }
             TokenKind::Template(_) => {
                 self.parse_template_literal()?;
@@ -381,20 +388,22 @@ impl<'source> Parser<'source> {
         while !self.is_punctuator(Punctuator::RightBracket) {
             if self.is_punctuator(Punctuator::Ellipsis) {
                 self.advance_expression_start()?;
-                // A `[` that is the *immediate* spread operand is a spread
-                // array, whose pinned C frame is marginally smaller than an
-                // ordinary array literal. A deeper bracket reached through any
-                // other production (e.g. the argument in `[...f([])]`) stays a
-                // normal array, so the branch is on the current token rather
-                // than a marker that nested parsing could observe.
-                if self.is_punctuator(Punctuator::LeftBracket) {
-                    self.parse_recursion(
-                        crate::engine::compiler::stack_guard::ParserStackFrame::SpreadElement,
-                        Self::parse_array_literal,
-                    )?;
-                } else {
-                    self.parse_assignment_allow_in()?;
-                }
+                // Pinned QuickJS always parses the complete Assignment-
+                // Expression after `...` (`js_parse_assign_expr`,
+                // quickjs.c:25732-25738), so postfix/member/index, binary/
+                // logical and conditional continuations after the operand are
+                // all consumed here. A `[` that is the *immediate* spread
+                // operand only swaps the leading array primary's charge to
+                // the marginally smaller spread-array frame; the flag is
+                // scoped to this operand, so a deeper bracket reached through
+                // any other production (e.g. the argument in `[...f([])]`)
+                // stays a normal array.
+                let pending = self.is_punctuator(Punctuator::LeftBracket);
+                let previous_spread_pending = self.spread_array_operand_pending;
+                self.spread_array_operand_pending = pending;
+                let operand = self.parse_assignment_allow_in();
+                self.spread_array_operand_pending = previous_spread_pending;
+                operand?;
                 self.emit_instruction(Instruction::Append)?;
             } else {
                 need_length = true;

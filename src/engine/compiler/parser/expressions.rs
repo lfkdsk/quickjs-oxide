@@ -108,6 +108,9 @@ impl<'source> Parser<'source> {
             return Err(self.syntax_here("invalid arrow function parameter"));
         }
         if let Some(head) = self.arrow_head_ahead() {
+            // An arrow head such as `[x]=>` owns the leading bracket; the
+            // spread-array charge was meant for an array-literal primary only.
+            self.spread_array_operand_pending = false;
             return self.parse_arrow_function(head);
         }
         // Destructuring assignment is recognized only after every arrow-head
@@ -118,6 +121,9 @@ impl<'source> Parser<'source> {
             return self.parse_object_assignment_expression();
         }
         if self.array_assignment_pattern_ahead() {
+            // `[...[x]=v]` parses the head bracket as an assignment pattern,
+            // not an array-literal primary, so no spread-array charge applies.
+            self.spread_array_operand_pending = false;
             return self.parse_array_assignment_expression();
         }
         // QuickJS's `name0` is captured only when the AssignmentExpression
