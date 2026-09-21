@@ -1073,6 +1073,57 @@ mod continuation_publication_tests {
     }
 
     #[test]
+    fn promise_resolving_publication_hides_backtrace_frames() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context();
+        for source in [
+            "Promise.withResolvers().resolve",
+            "Promise.withResolvers().reject",
+        ] {
+            let callable = runtime
+                .callable_from_value(context.eval(source).unwrap())
+                .unwrap();
+            let CallableExecution::Native {
+                target,
+                realm,
+                min_readable_args,
+            } = runtime.bytecode_for_callable(&callable).unwrap()
+            else {
+                panic!("native");
+            };
+            assert!(
+                matches!(target, NativeFunctionId::PromiseResolving(_)),
+                "{source} was not classified as a promise-resolving function"
+            );
+            let call = runtime
+                .prepare_native_continuation_owned(
+                    callable,
+                    realm,
+                    target,
+                    min_readable_args,
+                    NativeInvocation::Call {
+                        this_value: Value::Undefined,
+                    },
+                    vec![Value::Int(7)],
+                    NativeInvokeMode::Ordinary,
+                )
+                .unwrap();
+            {
+                let state = runtime.0.state.borrow();
+                let frame = state.active_frames.last().unwrap();
+                assert!(frame.native_continuation);
+                assert!(
+                    frame.flags.backtrace_hidden,
+                    "{source} frame must not appear in backtraces"
+                );
+                assert_eq!(frame.realm, realm);
+            }
+            drop(call);
+            assert!(runtime.0.state.borrow().active_frames.is_empty());
+        }
+    }
+
+    #[test]
     fn native_continuation_publication_rejects_stale_metadata_before_publishing() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context();

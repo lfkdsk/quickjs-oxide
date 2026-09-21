@@ -872,3 +872,25 @@ fn cross_realm_backtrace_uses_each_bytecode_filename_and_throwing_realm_error() 
         Some(type_error_prototype_a)
     );
 }
+
+/// QuickJS hands `JS_CLASS_PROMISE_RESOLVE_FUNCTION` straight to its class call
+/// handler, so thenable resolution leaves no resolving-function frame in an
+/// `Error.stack` captured by the `then` getter. Pinned QuickJS 2026-06-04
+/// reports `at get then (<cmdline>:1:52)`, `at resolve (native)`,
+/// `at <eval> (<cmdline>:1:23)` for this source.
+#[test]
+fn promise_resolving_frames_are_hidden_from_error_stacks() {
+    let runtime = Runtime::new();
+    let mut context = runtime.new_context();
+    let source = "var e; Promise.resolve({ get then() { e = new Error(\"gt\"); throw e; } });";
+    context.eval_with_filename(source, "<cmdline>").unwrap();
+    let Value::Object(error) = context.eval("e").unwrap() else {
+        panic!("then getter did not capture an Error");
+    };
+    assert_eq!(
+        own_stack_string(&runtime, &error),
+        JsString::from_static(
+            "    at get then (<cmdline>:1:52)\n    at resolve (native)\n    at <eval> (<cmdline>:1:23)\n"
+        )
+    );
+}
