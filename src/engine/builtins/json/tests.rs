@@ -361,6 +361,160 @@ fn assert_json_module_syntax_location(
     );
 }
 
+#[test]
+fn json_parse_nesting_cutoff_matches_the_pinned_stack_budget() {
+    // Pinned QuickJS derives its JSON nesting ceiling from its one-MiB C
+    // stack: a clean top-level call accepts 10,893 nested containers around a
+    // leaf and rejects the next value with a catchable SyntaxError. Empty
+    // containers reach one less value-entry depth, so they survive one level
+    // further. These exact clean-top-level counts are pinned here; see
+    // findings/verify-B10-json-depth.md for the call-depth jitter ledger.
+    let runtime = Runtime::new();
+    let mut context = runtime.new_context();
+
+    let mut outcome = |depth: usize, shape: &str| -> String {
+        let script = match shape {
+            "array-leaf" => format!(
+                r#"
+                    try {{
+                        JSON.parse("[".repeat({depth}) + "1" + "]".repeat({depth}));
+                        "ok";
+                    }} catch (error) {{
+                        error.name + ":" + error.message;
+                    }}
+                "#
+            ),
+            "array-empty" => format!(
+                r#"
+                    try {{
+                        JSON.parse("[".repeat({depth}) + "]".repeat({depth}));
+                        "ok";
+                    }} catch (error) {{
+                        error.name + ":" + error.message;
+                    }}
+                "#
+            ),
+            "object-leaf" => format!(
+                r#"
+                    try {{
+                        JSON.parse('{{"a":'.repeat({depth}) + "1" + "}}".repeat({depth}));
+                        "ok";
+                    }} catch (error) {{
+                        error.name + ":" + error.message;
+                    }}
+                "#
+            ),
+            other => panic!("unknown shape {other}"),
+        };
+        match context.eval(&script).unwrap() {
+            Value::String(text) => text.to_utf8_lossy(),
+            other => panic!("expected string outcome, got {other:?}"),
+        }
+    };
+
+    assert_eq!(outcome(10_893, "array-leaf"), "ok");
+    assert_eq!(outcome(10_894, "array-leaf"), "SyntaxError:stack overflow");
+    assert_eq!(outcome(10_894, "array-empty"), "ok");
+    assert_eq!(outcome(10_895, "array-empty"), "SyntaxError:stack overflow");
+
+    // Objects share the array frame shape and therefore the same cutoff.
+    assert_eq!(outcome(10_893, "object-leaf"), "ok");
+    assert_eq!(outcome(10_894, "object-leaf"), "SyntaxError:stack overflow");
+
+    // The descent is iterative: far beyond the ceiling it still throws a
+    // catchable SyntaxError rather than overflowing the host thread stack
+    // and aborting the process (the S3 robustness contract).
+    for depth in [100_000_usize, 1_000_000] {
+        assert_eq!(outcome(depth, "array-leaf"), "SyntaxError:stack overflow");
+        assert_eq!(outcome(depth, "object-leaf"), "SyntaxError:stack overflow");
+    }
+}
+
+#[test]
+fn json_parse_reviver_nesting_cutoff_matches_pinned_and_stays_catchable() {
+    // The pinned reviver walks post-order and checks its stack budget on
+    // entering `internalize_json_property`, so the ceiling is shallower
+    // (4,085 returns, 4,086 throws InternalError) and the exception kind is
+    // InternalError rather than SyntaxError.
+    let runtime = Runtime::new();
+    let mut context = runtime.new_context();
+
+    let mut outcome = |depth: usize| -> String {
+        let script = format!(
+            r#"
+                try {{
+                    JSON.parse(
+                        "[".repeat({depth}) + "1" + "]".repeat({depth}),
+                        function (key, value) {{ return value; }},
+                    );
+                    "ok";
+                }} catch (error) {{
+                    error.name + ":" + error.message;
+                }}
+            "#
+        );
+        match context.eval(&script).unwrap() {
+            Value::String(text) => text.to_utf8_lossy(),
+            other => panic!("expected string outcome, got {other:?}"),
+        }
+    };
+
+    assert_eq!(outcome(4_085), "ok");
+    assert_eq!(outcome(4_086), "InternalError:stack overflow");
+    // Beyond the parse ceiling the parser trips first, still catchably and
+    // without aborting on the host stack.
+    for depth in [100_000_usize, 1_000_000] {
+        assert_eq!(outcome(depth), "SyntaxError:stack overflow");
+    }
+
+    // A deep, in-budget walk stays post-order and hands the deepest leaf its
+    // pinned `context.source` slice, proving the iterative frame's owned
+    // parse records line up by array position.
+    let source_check = context
+        .eval(
+            r#"
+                (function () {
+                    var deepest = "none";
+                    JSON.parse(
+                        "[".repeat(4000) + "1" + "]".repeat(4000),
+                        function (key, value, context) {
+                            if (Object.prototype.hasOwnProperty.call(context, "source")) {
+                                deepest = context.source;
+                            }
+                            return value;
+                        },
+                    );
+                    return deepest;
+                })()
+            "#,
+        )
+        .unwrap();
+    assert_eq!(source_check, Value::String(JsString::from_static("1")));
+}
+
+#[test]
+fn json_parse_stack_overflow_reports_the_pinned_token_column() {
+    // The pinned check runs while advancing the nested value's token, so the
+    // diagnostic column points at the leaf token (n + 1 on a one-line array
+    // chain) rather than the end of input.
+    let runtime = Runtime::new();
+    let mut context = runtime.new_context();
+    let result = context.eval(
+        r#"
+            try {
+                JSON.parse("[".repeat(10894) + "1" + "]".repeat(10894));
+                "missing";
+            } catch (error) {
+                error.name + ":" + error.columnNumber;
+            }
+        "#,
+    );
+    assert_eq!(
+        result.unwrap(),
+        Value::String(JsString::from_static("SyntaxError:10895")),
+    );
+}
+
 fn assert_json5_module_syntax_location(
     source: &str,
     expected_message: &str,

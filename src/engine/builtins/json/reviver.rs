@@ -17,7 +17,11 @@ use crate::engine::value::{JsString, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::NativeArguments;
 
-const MAX_JSON_REVIVER_DEPTH: usize = 128;
+/// Pinned QuickJS enters 4,086 nested `internalize_json_property` calls before
+/// its one-MiB stack budget rejects the walk. This resumable state machine
+/// keeps those nodes on the heap, so the logical budget is safe for the host
+/// stack while preserving the pinned clean-call cutoff.
+const MAX_JSON_REVIVER_DEPTH: usize = 4_085;
 
 impl Runtime {
     pub(crate) fn call_json_parse(
