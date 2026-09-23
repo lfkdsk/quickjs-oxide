@@ -142,8 +142,6 @@ fn run_child(mut arguments: impl Iterator<Item = String>) -> ExitCode {
 /// depth `frames`. `set -e`-style chaining means a refused `ulimit` fails the
 /// row instead of masking a sandbox refusal.
 struct RowResult {
-    limit: &'static str,
-    frames: &'static str,
     status: Option<ExitStatus>,
     stdout: String,
     stderr: String,
@@ -185,8 +183,6 @@ fn run_row(probe: &str, limit: &'static str, frames: &'static str) -> RowResult 
         .wait_with_output()
         .expect("collect probe output after kill");
     RowResult {
-        limit,
-        frames,
         status,
         stdout: String::from_utf8(output.stdout).expect("probe utf8 stdout"),
         stderr: String::from_utf8(output.stderr).expect("probe utf8 stderr"),
