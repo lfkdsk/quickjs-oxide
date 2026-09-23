@@ -357,6 +357,7 @@ mod tests {
             module_declaration_export_target: None,
             anonymous_function_definition: None,
             pending_unsupported: None,
+            stack_guard: super::super::stack_guard::ParserStackGuard::new(),
         };
         parser.push_scope(ScopeKind::ClassPrivate);
         parser

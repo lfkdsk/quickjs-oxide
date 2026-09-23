@@ -102,6 +102,57 @@ cargo run --quiet --locked --bin qjs -- -e 'try{Function("for (x => 0 in 1;;) br
 
 Pinned QuickJS prints `accepted`; Rust prints `SyntaxError`.
 
+### PARSER-DEPTH-WITH-OBJECT-HEAD-001
+
+- Status: approved target deviation on 2026-09-17, as part of task B8
+  (S3 P1 / S2 C3: parser deep nesting aborts → catchable error).
+- Approved by: the maintainer's standing delegation of robustness-gate
+  implementation judgment for B8; the cross-task reviewer reconciles the
+  exact-depth residual here.
+- Surface: the exact nesting depth at which a nested `with` statement whose
+  head discriminant is an object literal throws the parser stack-overflow
+  early error.
+- Exact observable: `eval("with({}){".repeat(n) + "0" + "}".repeat(n))`.
+  Pinned QuickJS accepts through depth 1674 and first throws at 1675;
+  quickjs-oxide first throws at depth 1674. Every other bounded production is
+  exact (parenthesized 718, array 743, object 355, unary 9330, conditional
+  8164, concise arrow 4665, block arrow 1420, template 635, brace-free
+  if/switch 3438, block/try 3266, braced while/do/if 1675,
+  function/generator body 2613, call/new 743, bare nested objects 701).
+- Upstream anchor: pinned `next_token()` (`quickjs.c:22719`) bounds parser
+  recursion with one physical 1 MiB byte budget; different productions fail
+  at different depths purely because their C frames differ in size. The
+  transient object-literal discriminant in the head of a nested `with`
+  occupies a smaller physical C frame than the Rust parser's modeled
+  marginal edge, so the C byte budget admits one more nesting level.
+- Rationale: the parser is now bounded by a weighted depth budget that
+  reproduces the pinned 1 MiB accounting (weights `2^32 / (depth - 1)`,
+  mixed nesting summing like the single C byte budget) plus a physical
+  host-stack backstop that guarantees a catchable `SyntaxError: stack
+  overflow` instead of the previous process abort (SIGABRT). The two engines
+  agree on error type, message, catchability, and process exit code at every
+  depth and on the exact trigger depth for every other production; only this
+  one compound head is one nesting level conservative. Reproducing the exact
+  transient frame residency would require modeling C call-stack frame sizes
+  the Rust recursive-descent parser does not share, for no change in the
+  JavaScript-visible error contract.
+- Compatibility impact: a program nesting 1674 or more `with({}){` heads
+  whose author catches the parse error sees it one level earlier in Rust;
+  the error is the same catchable `SyntaxError: stack overflow`, the runtime
+  continues afterward, and an uncaught throw still exits 1. No shallow
+  program (including all of test262, which contains no such construction) is
+  affected. The library never aborts regardless of host thread stack size.
+
+Minimal probe:
+
+```sh
+qjs -e 'try{eval("with({}){".repeat(1674)+"0"+"}".repeat(1674));print("accepted")}catch(e){print(e.name+":"+e.message)}'
+```
+
+Pinned QuickJS prints `accepted`; quickjs-oxide prints
+`SyntaxError:stack overflow`. At depth 1675 both print the
+`SyntaxError:stack overflow`.
+
 ## Resolved findings
 
 ### FORIN-FAST-ARRAY-001
