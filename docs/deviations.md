@@ -164,8 +164,8 @@ Three distinct, measurable context shifts remain:
    native depth and inside a wrapper function. Of the 63 forms, 8 shallow
    grammar probes agree and the three spread/pattern runtime-message probes
    are a separate pre-existing `Symbol.iterator` difference; the remaining
-   forms first throw slightly later in oxide. Representative rows (full vector
-   in `findings/b8r4/boundary_function.txt`): `paren` 716→715, `array`/`call`
+   forms first throw slightly later in oxide. Representative first-throw rows
+   (oxide → pinned): `paren` 716→715, `array`/`call`
    741→739, `block` 3261→3252, `if`/`switch`/`label` 3431–3432→3423,
    `conditional`/`assign` 8149→8128, `unary` 9313→9289,
    `class-extends` 716→534, `class-static-block` 8831→1016,
@@ -215,9 +215,8 @@ Three distinct, measurable context shifts remain:
   these extreme depths observe a different first-throw depth; the thrown value
   is catchable and has the same name/message for the standalone-shape rows, the
   runtime continues afterward, and an uncaught throw still exits 1. No shallow
-  program (including all of test262) is affected. Reproduction vectors and the
-  full 63-family × five-entry matrices are recorded under
-  `findings/b8r4/` (`boundary_{eval,cmdline,direct,module,function}.txt`).
+  program (including all of test262) is affected. The tables above retain the measured residuals from the 63-family ×
+  five-entry review matrix; minimal reproduction commands follow below.
   - 2026-09-19 B8-r4 interim regression, closed by B8-r5 (task 1178): while
     charging the immediate spread-array operand, the operand was parsed by a
     direct `parse_array_literal` call instead of the full AssignmentExpression,
@@ -256,8 +255,7 @@ qjs -e 'try{eval("({get a(){return ".repeat(284)+"0"+"}})".repeat(284));print("o
   1674 and first throws at 1675, and a direct Script/Module root accepts
   through 1676 and first throws at 1677, byte-for-byte matching pinned
   QuickJS including the uncaught diagnostic location. Regression coverage:
-  `tests/parser_stack_depth.rs` (eval and direct boundaries) and
-  `findings/b8r4/boundary_eval.txt` / `boundary_cmdline.txt`.
+  `tests/parser_stack_depth.rs` (eval and direct boundaries).
 
 ### FORIN-FAST-ARRAY-001
 
